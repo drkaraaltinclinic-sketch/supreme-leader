@@ -187,6 +187,15 @@ function equityNow() {
   state.positions.forEach(p => { const px = state.prices[p.asset]; if (px) u += unrealized(p, px); });
   return START_BUDGET + state.realized + u;
 }
+// THESIS TAG: identifies concurrent trades that share the SAME macro bet across DIFFERENT
+// assets (e.g. "extreme fear, buy the dip" expressed via BTC, UNI and AAVE at once) — a pattern
+// MATRIX's price-correlation clustering does not catch, since these assets needn't be correlated.
+function thesisTagFor(direction, fng) {
+  if (fng == null) return null;
+  if (direction === 'LONG' && fng <= 30) return 'CONTRARIAN_FEAR_LONG';
+  if (direction === 'SHORT' && fng >= 70) return 'CONTRARIAN_GREED_SHORT';
+  return null;
+}
 
 // ─── Prices ───────────────────────────────────────────────────────────────────
 async function refreshPrices() {
@@ -313,6 +322,11 @@ async function decisionCycle() {
       // Book: cluster cap (max 2 per cluster) + net delta cap
       const cluster = clusters.find(c => c.includes(cand.asset));
       if (cluster && state.positions.filter(p => cluster.includes(p.asset)).length >= 2) vetoes.push('CLUSTER_CAP');
+      // Thesis cluster: with only MAX_POSITIONS(4) slots, 2-3 concurrent contrarian-fear (or
+      // contrarian-greed) longs/shorts across unrelated tickers can fill most of the book on one bet.
+      const thesisTag = thesisTagFor(cand.direction, fng);
+      const sameThesisOpen = thesisTag ? state.positions.filter(p => p.thesisTag === thesisTag).length : 0;
+      if (thesisTag && sameThesisOpen >= 2) vetoes.push('THESIS_CLUSTER_CAP');
       const netDelta = state.positions.reduce((s, p) => s + (p.direction === 'LONG' ? 1 : -1) * p.notional, 0);
       const dSign = cand.direction === 'LONG' ? 1 : -1;
       if (Math.sign(netDelta) === dSign && Math.abs(netDelta) >= eq * NET_DELTA_CAP) vetoes.push('NET_DELTA_CAP');
@@ -360,6 +374,17 @@ async function decisionCycle() {
         if (res.ok) vizier = await res.json();
       } catch (e) {}
       if (!['CONCUR', 'CONCUR_REDUCED', 'OBJECT'].includes(vizier.verdict)) vizier = { verdict: 'CONCUR', sizeMultiplier: 1, reason: 'malformed review — mechanical rules govern' };
+      // Thesis cluster: force half-size on the 2nd concurrent position sharing the same contrarian
+      // macro bet, even when Vizier itself said plain CONCUR — this is what the asset-correlation
+      // cluster cap misses, since these tickers aren't price-correlated to each other.
+      if (thesisTag && sameThesisOpen === 1 && vizier.verdict === 'CONCUR') {
+        vizier = { verdict: 'CONCUR_REDUCED', sizeMultiplier: Math.min(vizier.sizeMultiplier || 1, 0.5),
+          reason: `THESIS_CLUSTER: 2nd concurrent ${thesisTag} — size halved regardless of individual conviction. ${vizier.reason || ''}`.slice(0, 300) };
+      }
+      // Broadcast full Vizier reasoning (not just the verdict) to the network bus so KAIZEN can
+      // actually see WHY trades were approved/reduced/objected, not only that they were.
+      toHub('VIZIER', 'vizier.memo', { asset: cand.asset, direction: cand.direction, verdict: vizier.verdict,
+        reason: (vizier.reason || '').slice(0, 300), conviction, thesisTag: thesisTag || null, sameThesisOpen, fng });
       if (vizier.verdict === 'OBJECT') {
         state.vetoCounts.VIZIER_OBJECT = (state.vetoCounts.VIZIER_OBJECT || 0) + 1;
         record({ asset: cand.asset, direction: cand.direction, source: cand.source, action: 'VIZIER_OBJECTED', conviction, votes, vizier: { verdict: vizier.verdict, reason: vizier.reason } });
@@ -383,6 +408,7 @@ async function decisionCycle() {
       state.posSeq++;
       const pos = {
         id: state.posSeq, asset: cand.asset, direction: cand.direction, source: cand.source, blueprint: cand.blueprint || null,
+        thesisTag: thesisTag || null,
         entryPx: +fillPx.toPrecision(6), notional: +notional.toFixed(2),
         riskUsd: +riskUsd.toFixed(2), riskDist: fillPx * riskDistPct,
         stopPx: +(fillPx * (1 - dir * riskDistPct)).toPrecision(6),
@@ -538,6 +564,13 @@ function connectGecko(){geckoWs=new WebSocket(GECKO_URL);
 connectGecko();
 setInterval(()=>{if(geckoWs?.readyState===WebSocket.OPEN){geckoWs.send(JSON.stringify({type:'PING'}));
   geckoWs.send(JSON.stringify({type:'STATUS',agentId:'SUPREME-LEADER',stats:{equity:'$'+state.equity.toFixed(0),positions:state.positions.length,trades:state.trades.length}}));}},15000);
+// Publish a message onto the GECKO-01 hub (the real inter-agent bus) — distinct from emit(), which
+// only reaches SUPREME-LEADER's own local dashboard clients. Needed so KAIZEN etc. actually hear this.
+function toHub(type, topic, data) {
+  if (geckoWs && geckoWs.readyState === WebSocket.OPEN) {
+    try { geckoWs.send(JSON.stringify({ type, topic, agentId: 'SUPREME-LEADER', data, timestamp: nowIso() })); } catch (e) {}
+  }
+}
 
 wss.on('connection',ws=>{
   ws.send(JSON.stringify({type:'SYS',topic:'supreme.handshake',agentId:'SUPREME-LEADER',timestamp:nowIso(),
