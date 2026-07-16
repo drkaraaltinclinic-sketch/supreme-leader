@@ -114,6 +114,19 @@ function loadState() {
   } catch (e) { console.log('[BOOT] Fresh ledger'); }
 }
 loadState();
+// One-time backfill: positions opened by the pre-patch code have no thesisTag field. Reconstruct
+// it from their stored fearGreed vote so the thesis-cluster cap accounts for the existing book,
+// not only trades opened after this deploy.
+(function backfillThesisTags() {
+  let n = 0;
+  state.positions.forEach(p => {
+    if (p.thesisTag === undefined || p.thesisTag === null) {
+      const tag = thesisTagFromVotes(p.direction, p.votes);
+      if (tag) { p.thesisTag = tag; n++; }
+    }
+  });
+  if (n) console.log(`[BOOT] Backfilled thesisTag on ${n} pre-existing position(s)`);
+})();
 setInterval(saveState, 60000);
 
 // ─── HERALD: raw Gmail SMTP (no dependencies) ─────────────────────────────────
@@ -194,6 +207,17 @@ function thesisTagFor(direction, fng) {
   if (fng == null) return null;
   if (direction === 'LONG' && fng <= 30) return 'CONTRARIAN_FEAR_LONG';
   if (direction === 'SHORT' && fng >= 70) return 'CONTRARIAN_GREED_SHORT';
+  return null;
+}
+// Reconstructs the same tag for positions opened by pre-patch code, which have no thesisTag field
+// but DO have their votes.fearGreed saved. Note: votes.fearGreed was computed at the tighter ±25/75
+// band (not thesisTagFor's ±30/70), so this backfill is a strict subset — it will not retroactively
+// tag a legacy position opened at, say, fng=28. Good enough to close most of the gap without needing
+// the original raw fng value, which was never stored on the position.
+function thesisTagFromVotes(direction, votes) {
+  if (!votes || votes.fearGreed == null) return null;
+  if (direction === 'LONG' && votes.fearGreed === 1) return 'CONTRARIAN_FEAR_LONG';
+  if (direction === 'SHORT' && votes.fearGreed === 1) return 'CONTRARIAN_GREED_SHORT';
   return null;
 }
 
