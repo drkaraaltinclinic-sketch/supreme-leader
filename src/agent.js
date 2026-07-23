@@ -627,7 +627,15 @@ app.post('/cycle',(_,res)=>{decisionCycle();res.json({ok:true});});
 app.post('/pause',(_,res)=>{state.paused=true;res.json({paused:true});});
 app.post('/resume',(_,res)=>{state.paused=false;res.json({paused:false});});
 app.post('/digest',(_,res)=>{sendEmail(`👑 Daily Digest — Equity ${fmt$(equityNow())}`,digestHtml()).then(ok=>res.json({sent:ok}));});
-
+const { mountWeeklyReport } = require('./weekly-report');
+mountWeeklyReport(app, {
+  getState: () => state,
+  getConfig: () => ({ START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
+    MAX_NEW_PER_DAY, MAX_LEV, NET_DELTA_CAP, ATR_STOP_MULT, TARGET_R, MAX_HOLD_H,
+    FEE_BPS, SLIP_BPS, MIN_VOL_USD, MIN_OI_USD, ENTRY_SCORE, DECISION_MS, STRATEGY_MODE }),
+  getScoreboard: () => scoreboard(),
+  getEquityNow:  () => equityNow(),
+});
 server.listen(PORT,()=>{
   console.log('\n╔════════════════════════════════════════════════╗');
   console.log('║   👑 SUPREME LEADER — The Throne               ║');
