@@ -51,6 +51,10 @@ const ENTRY_SCORE = parseFloat(process.env.ENTRY_SCORE || '3');
 // Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
 // Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
 const SUSPEND_THESIS_TAGS = (process.env.SUSPEND_THESIS_TAGS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+// ACTUARY edge vote: weight of the historical-expectancy conviction vote (0 disables),
+// and the minimum bucket sample size before the archive is allowed to speak.
+const EDGE_WEIGHT = parseFloat(process.env.EDGE_WEIGHT || '1');
+const EDGE_MIN_TRADES = parseInt(process.env.EDGE_MIN_TRADES || '5');
 const STATE_DIR = process.env.STATE_DIR || (fs.existsSync('/data') ? '/data' : './data');
 // HERALD
 const EMAIL_TO = process.env.EMAIL_TO || '';
@@ -68,6 +72,7 @@ const SIBLINGS = {
   SHERLOCK: 'https://sherlock-01-agent-production.up.railway.app',
   STRATEGOS: 'https://strategos-01-agent-production.up.railway.app',
   VIZIER: 'https://vizier-01-agent-production.up.railway.app',
+  ACTUARY: process.env.ACTUARY_URL || 'https://actuary-production.up.railway.app',
 };
 (process.env.AGENT_URLS || '').split(',').map(s => s.trim()).filter(Boolean).forEach(pair => {
   const [k, ...rest] = pair.split('=');
@@ -378,6 +383,22 @@ async function decisionCycle() {
       votes.fearGreed = fng != null ? (fng <= 25 ? 1 * dir : fng >= 75 ? -1 * dir : 0) : 0;
       const rs = rsOf[cand.asset]?.rsVsBtc;
       votes.relStrength = rs != null ? (rs > 10 ? 0.5 * dir : rs < -10 ? -0.5 * dir : 0) : 0;
+      // ACTUARY edge: what has this direction × thesis × confluence bucket actually
+      // earned historically? Bounded ±EDGE_WEIGHT, silent below EDGE_MIN_TRADES
+      // samples, fail-open when the actuary is unreachable — archives advise, never veto.
+      votes.actuaryEdge = 0;
+      if (EDGE_WEIGHT > 0) {
+        try {
+          const breadth = ['blueprint', 'macro', 'mood', 'contrarianCrowd', 'fearGreed', 'relStrength'].filter(k => (votes[k] || 0) !== 0).length;
+          const ares = await fetch(`${SIBLINGS.ACTUARY}/ev?direction=${cand.direction}&thesisTag=${encodeURIComponent(thesisTag || '')}&confluence=${breadth}`, { timeout: 8000 });
+          if (ares.ok) {
+            const edge = await ares.json();
+            if ((edge.n || 0) >= EDGE_MIN_TRADES && edge.confidence !== 'INSUFFICIENT' && edge.ev != null) {
+              votes.actuaryEdge = +Math.max(-EDGE_WEIGHT, Math.min(EDGE_WEIGHT, (edge.ev / 0.5) * EDGE_WEIGHT)).toFixed(2);
+            }
+          }
+        } catch (e) {}
+      }
       const conviction = +Object.values(votes).reduce((a, b) => a + b, 0).toFixed(1);
 
       if (conviction < CONVICTION_MIN) {
