@@ -48,6 +48,9 @@ const DECISION_MS = parseInt(process.env.DECISION_MS || '900000');    // 15 min
 const MANAGE_MS = parseInt(process.env.MANAGE_MS || '60000');         // 1 min
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'ALL').toUpperCase(); // ALL | CURATED
 const ENTRY_SCORE = parseFloat(process.env.ENTRY_SCORE || '3');
+// Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
+// Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
+const SUSPEND_THESIS_TAGS = (process.env.SUSPEND_THESIS_TAGS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 const STATE_DIR = process.env.STATE_DIR || (fs.existsSync('/data') ? '/data' : './data');
 // HERALD
 const EMAIL_TO = process.env.EMAIL_TO || '';
@@ -351,6 +354,7 @@ async function decisionCycle() {
       const thesisTag = thesisTagFor(cand.direction, fng);
       const sameThesisOpen = thesisTag ? state.positions.filter(p => p.thesisTag === thesisTag).length : 0;
       if (thesisTag && sameThesisOpen >= 2) vetoes.push('THESIS_CLUSTER_CAP');
+      if (thesisTag && SUSPEND_THESIS_TAGS.includes(thesisTag)) vetoes.push(`THESIS_SUSPENDED(${thesisTag})`);
       const netDelta = state.positions.reduce((s, p) => s + (p.direction === 'LONG' ? 1 : -1) * p.notional, 0);
       const dSign = cand.direction === 'LONG' ? 1 : -1;
       if (Math.sign(netDelta) === dSign && Math.abs(netDelta) >= eq * NET_DELTA_CAP) vetoes.push('NET_DELTA_CAP');
