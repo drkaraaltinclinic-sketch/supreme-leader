@@ -2,7 +2,8 @@
 
 /**
  * weekly-report.js — SUPREME-LEADER weekly report generator
- * v1.1 · mapped to the real agent.js schema (state.trades / state.decisions / state.meta)
+ * v1.2 · v1.1 schema + actuaryEdge vote visibility in the decision record and
+ *        per-trade openedAt (Sultan's Review observability items)
  *
  * Mounts:
  *   GET /api/report/weekly       → markdown as text/plain (paste straight into chat)
@@ -97,6 +98,11 @@ function analyseDecisions(decisions, vetoCounts) {
   const actions = new Map();
   const vetoInRecord = new Map();
 
+  // ACTUARY edge visibility (v1.2): decisions that reached Tier-2 carry a
+  // `votes` object; expose whether the actuaryEdge vote is ever nonzero so
+  // "silent under EDGE_MIN_TRADES" is distinguishable from "not wired in".
+  let votesSeen = 0, edgeNonzero = 0, edgeSum = 0, edgeMin = 0, edgeMax = 0;
+
   for (const d of decisions) {
     ids.add(d.id ?? `${d.at}|${d.asset}|${d.action}`);
     const a = d.action || 'UNKNOWN';
@@ -104,6 +110,16 @@ function analyseDecisions(decisions, vetoCounts) {
     for (const v of arr(d.vetoes)) {
       const key = String(v).split('(')[0];
       vetoInRecord.set(key, (vetoInRecord.get(key) || 0) + 1);
+    }
+    if (d.votes && typeof d.votes === 'object') {
+      votesSeen++;
+      const e = num(d.votes.actuaryEdge, 0);
+      if (e !== 0) {
+        edgeNonzero++;
+        edgeSum += e;
+        if (e < edgeMin) edgeMin = e;
+        if (e > edgeMax) edgeMax = e;
+      }
     }
   }
 
@@ -124,6 +140,13 @@ function analyseDecisions(decisions, vetoCounts) {
     executed,
     evaluated,
     executionRate: evaluated ? (executed / evaluated) * 100 : NaN,
+    actuaryEdge: {
+      recordsWithVotes: votesSeen,
+      nonzero: edgeNonzero,
+      avg: edgeNonzero ? +(edgeSum / edgeNonzero).toFixed(3) : null,
+      min: edgeMin,
+      max: edgeMax,
+    },
   };
 }
 
@@ -184,7 +207,7 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
 
   return {
     generatedAt: new Date().toISOString(),
-    version: '1.1',
+    version: '1.2',
     windowDays: WINDOW_DAYS,
 
     performance: {
@@ -229,7 +252,8 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
       asset: t.asset, direction: t.direction, entryPx: t.entryPx, exitPx: t.exitPx,
       r: num(t.r, NaN), pnl: num(t.pnl, NaN), reason: t.reason,
       heldHours: heldHours(t), vizier: obj(t.vizier).verdict || '',
-      thesisTag: t.thesisTag || '', conviction: t.conviction, source: t.source, closedAt: t.closedAt,
+      thesisTag: t.thesisTag || '', conviction: t.conviction, source: t.source,
+      openedAt: t.openedAt || null, closedAt: t.closedAt,
     })),
     tradesTruncated: Math.max(0, trades.length - MAX_TRADE_ROWS),
   };
@@ -308,6 +332,10 @@ function renderMarkdown(rep) {
   }
   L.push('');
   L.push(`Evaluated ${d.evaluated} · executed ${d.executed} · rate ${pct(d.executionRate, 1)}`);
+  L.push('');
+  const ae = obj(d.actuaryEdge);
+  L.push(`ACTUARY edge vote: ${ae.recordsWithVotes ?? 0} records carry Tier-2 votes · nonzero actuaryEdge in ${ae.nonzero ?? 0}` +
+    (ae.nonzero ? ` (avg ${ae.avg}, range ${ae.min}…${ae.max})` : ' — silent (below EDGE_MIN_TRADES samples, or vetoed before Tier-2)'));
   L.push('');
   if (d.actionBreakdown.length) {
     L.push(`| Action | Count (in record) |`, `|---|---|`);
