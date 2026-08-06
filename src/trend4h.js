@@ -51,12 +51,12 @@ function computeSignal(candles, fastP = 8, slowP = 24) {
 }
 
 /** Fetch closed BTC 4h candles from Hyperliquid and compute the signal. */
-async function getSignal(fetchImpl, hlApi, { fastP = 8, slowP = 24 } = {}) {
+async function getSignal(fetchImpl, hlApi, { fastP = 8, slowP = 24, coin = 'BTC', interval = '4h', barMs = H4_MS } = {}) {
   const end = Date.now();
-  const start = end - H4_MS * (slowP * 3 + 40);
+  const start = end - barMs * (slowP * 3 + 40);
   const res = await fetchImpl(hlApi, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'candleSnapshot', req: { coin: 'BTC', interval: '4h', startTime: start, endTime: end } }),
+    body: JSON.stringify({ type: 'candleSnapshot', req: { coin, interval, startTime: start, endTime: end } }),
     timeout: 15000,
   });
   if (!res.ok) throw new Error(`trend4h candles http ${res.status}`);
@@ -66,7 +66,7 @@ async function getSignal(fetchImpl, hlApi, { fastP = 8, slowP = 24 } = {}) {
     .filter((b) => Number.isFinite(b.t) && Number.isFinite(b.c))
     .sort((a, b) => a.t - b.t);
   // Drop the still-forming bar: closed bars only, like the assay.
-  while (bars.length && Date.now() - bars[bars.length - 1].t < H4_MS) bars.pop();
+  while (bars.length && Date.now() - bars[bars.length - 1].t < barMs) bars.pop();
   return computeSignal(bars, fastP, slowP);
 }
 

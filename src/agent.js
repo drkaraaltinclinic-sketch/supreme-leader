@@ -56,6 +56,13 @@ const ENTRY_SCORE = parseFloat(process.env.ENTRY_SCORE || '3');
 const ENTRY_MODE = (process.env.ENTRY_MODE || 'BTC4H').toUpperCase(); // BTC4H | LEGACY
 const TREND4H_FAST = parseInt(process.env.TREND4H_FAST || '8');
 const TREND4H_SLOW = parseInt(process.env.TREND4H_SLOW || '24');
+// ── SPOT sleeve (directed by Dr K 2026-08-06): BTC spot-style paper positions —
+// LONGS ONLY, NO leverage (notional capped at 1x equity), daily bars, EMA 8/24
+// (best longs-only assay: CRUCIBLE #19, PF 1.055). Trials measure; the per-sleeve
+// probation ledger and kill-switch guard the experiment. SPOT_SLEEVE=OFF disables.
+const SPOT_SLEEVE = (process.env.SPOT_SLEEVE || 'ON').toUpperCase();  // ON | OFF
+const SPOT1D_FAST = parseInt(process.env.SPOT1D_FAST || '8');
+const SPOT1D_SLOW = parseInt(process.env.SPOT1D_SLOW || '24');
 // Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
 // Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
 const SUSPEND_THESIS_TAGS = (process.env.SUSPEND_THESIS_TAGS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
@@ -117,7 +124,8 @@ function saveState() {
       peakEquity: state.peakEquity, maxDrawdownPct: state.maxDrawdownPct,
       positions: state.positions, trades: state.trades.slice(0, 300), decisions: state.decisions.slice(0, 200),
       posSeq: state.posSeq, decSeq: state.decSeq, vetoCounts: state.vetoCounts,
-      trend4hLastActedT: state.trend4hLastActedT || null };
+      trend4hLastActedT: state.trend4hLastActedT || null,
+      spot1dLastActedT: state.spot1dLastActedT || null };
     fs.writeFileSync(path.join(STATE_DIR, 'throne.json'), JSON.stringify(snap));
   } catch (e) {}
 }
@@ -137,6 +145,7 @@ loadState();
 (function backfillThesisTags() {
   let n = 0;
   state.positions.forEach(p => {
+    if (p.source === 'TREND4H' || p.source === 'SPOT1D') return; // mechanical sleeves are never thesis-tagged
     if (p.thesisTag === undefined || p.thesisTag === null) {
       const tag = thesisTagFromVotes(p.direction, p.votes);
       if (tag) { p.thesisTag = tag; n++; }
@@ -357,11 +366,27 @@ async function decisionCycle() {
       } catch (e) { reportError(`trend4h: ${e.message}`); }
     }
 
+    // ── SPOT sleeve: BTC 1d longs-only, spot semantics (no leverage, no shorts) ──
+    if (SPOT_SLEEVE === 'ON') {
+      try {
+        const sig = await trend4h.getSignal(fetch, HL_API,
+          { fastP: SPOT1D_FAST, slowP: SPOT1D_SLOW, coin: 'BTC', interval: '1d', barMs: 86400000 });
+        if (sig.ready && sig.direction === 'LONG'
+            && !state.positions.find(p => p.source === 'SPOT1D')
+            && sig.lastBarT !== state.spot1dLastActedT) {
+          candidates.push({ asset: 'BTC', direction: 'LONG', source: 'SPOT1D',
+            engineScore: 0, atrPct: sig.atrPct, spot1dBarT: sig.lastBarT, spotNoLev: true,
+            rationale: `BTC 1d EMA ${SPOT1D_FAST}/${SPOT1D_SLOW} LONG — spot sleeve (crossAge ${sig.crossAge ?? '—'})` });
+        }
+      } catch (e) { reportError(`spot1d: ${e.message}`); }
+    }
+
     let executed = 0;
     for (const cand of candidates.slice(0, 12)) {
       if (state.positions.length >= MAX_POSITIONS) break;
       if (state.todayOpens >= MAX_NEW_PER_DAY) break;
-      if (state.positions.find(p => p.asset === cand.asset)) continue;
+      // one position per asset PER SLEEVE CLASS: the spot sleeve may hold BTC alongside a perp BTC position
+      if (state.positions.find(p => p.asset === cand.asset && ((p.source === 'SPOT1D') === (cand.source === 'SPOT1D')))) continue;
       const px = state.prices[cand.asset];
       const m = state.meta[cand.asset];
       if (!px || !m) continue;
@@ -381,8 +406,9 @@ async function decisionCycle() {
       if (cluster && state.positions.filter(p => cluster.includes(p.asset)).length >= 2) vetoes.push('CLUSTER_CAP');
       // Thesis cluster: with only MAX_POSITIONS(4) slots, 2-3 concurrent contrarian-fear (or
       // contrarian-greed) longs/shorts across unrelated tickers can fill most of the book on one bet.
-      // TREND4H is mechanical trend-following, not a contrarian thesis \u2014 exempt from thesis tagging.
-      const thesisTag = cand.source === 'TREND4H' ? null : thesisTagFor(cand.direction, fng);
+      // Mechanical sleeves (TREND4H, SPOT1D) are not contrarian theses — exempt from thesis tagging.
+      const mech = cand.source === 'TREND4H' || cand.source === 'SPOT1D';
+      const thesisTag = mech ? null : thesisTagFor(cand.direction, fng);
       const sameThesisOpen = thesisTag ? state.positions.filter(p => p.thesisTag === thesisTag).length : 0;
       if (thesisTag && sameThesisOpen >= 2) vetoes.push('THESIS_CLUSTER_CAP');
       if (thesisTag && SUSPEND_THESIS_TAGS.includes(thesisTag)) vetoes.push(`THESIS_SUSPENDED(${thesisTag})`);
@@ -427,14 +453,14 @@ async function decisionCycle() {
       }
       const conviction = +Object.values(votes).reduce((a, b) => a + b, 0).toFixed(1);
 
-      if (conviction < CONVICTION_MIN && cand.source !== 'TREND4H') {
+      if (conviction < CONVICTION_MIN && !mech) {
         record({ asset: cand.asset, direction: cand.direction, source: cand.source, action: 'REJECTED', conviction, votes, rationale: `conviction ${conviction} < ${CONVICTION_MIN}` });
         continue;
       }
 
       // ── VIZIER REVIEW ──
       let vizier = { verdict: 'CONCUR', sizeMultiplier: 1, reason: 'Vizier unreachable — mechanical rules govern (constitutional fail-safe)' };
-      if (cand.source === 'TREND4H') vizier = { verdict: 'CONCUR', sizeMultiplier: 1, reason: 'TREND4H probation: mechanical entry as assayed (CRUCIBLE #13) — IC review bypassed' };
+      if (mech) vizier = { verdict: 'CONCUR', sizeMultiplier: 1, reason: `${cand.source} probation: mechanical entry as assayed — IC review bypassed` };
       else try {
         const res = await fetch(SIBLINGS.VIZIER + '/review', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -470,10 +496,11 @@ async function decisionCycle() {
       // ── SIZE & EXECUTE (paper) ──
       const atrPct = cand.atrPct || 3;
       const riskDistPct = (ATR_STOP_MULT * atrPct) / 100;
-      const convMult = cand.source === 'TREND4H' ? 1 : Math.max(0.5, Math.min(1.5, conviction / CONVICTION_MIN));
+      const convMult = mech ? 1 : Math.max(0.5, Math.min(1.5, conviction / CONVICTION_MIN));
       const riskUsd = eq * (RISK_PCT / 100) * convMult * (vizier.sizeMultiplier || 1);
       let notional = riskUsd / riskDistPct;
       notional = Math.min(notional, eq * MAX_LEV / 2);           // leverage guard
+      if (cand.spotNoLev) notional = Math.min(notional, eq);     // spot: never above 1x equity
       if (notional < 10) {
         record({ asset: cand.asset, direction: cand.direction, source: cand.source, action: 'REJECTED', conviction, rationale: 'position below $10 minimum after sizing' });
         continue;
@@ -494,6 +521,7 @@ async function decisionCycle() {
       state.realized -= entryFee; state.fees += entryFee;
       state.positions.push(pos);
       if (cand.trend4hBarT) state.trend4hLastActedT = cand.trend4hBarT;
+      if (cand.spot1dBarT) state.spot1dLastActedT = cand.spot1dBarT;
       state.todayOpens++; executed++;
       record({ asset: pos.asset, direction: pos.direction, source: pos.source, action: 'EXECUTED', conviction, votes,
         vizier: pos.vizier, sizing: { notional: pos.notional, riskUsd: pos.riskUsd, entry: pos.entryPx, stop: pos.stopPx, target: pos.targetPx } });
@@ -683,7 +711,7 @@ app.post('/digest',(_,res)=>{sendEmail(`👑 Daily Digest — Equity ${fmt$(equi
 const { mountWeeklyReport } = require('./weekly-report');
 mountWeeklyReport(app, {
   getState: () => state,
-  getConfig: () => ({ ENTRY_MODE, TREND4H_FAST, TREND4H_SLOW, START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
+  getConfig: () => ({ ENTRY_MODE, TREND4H_FAST, TREND4H_SLOW, SPOT_SLEEVE, SPOT1D_FAST, SPOT1D_SLOW, START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
     MAX_NEW_PER_DAY, MAX_LEV, NET_DELTA_CAP, ATR_STOP_MULT, TARGET_R, MAX_HOLD_H,
     FEE_BPS, SLIP_BPS, MIN_VOL_USD, MIN_OI_USD, ENTRY_SCORE, DECISION_MS, STRATEGY_MODE }),
   getScoreboard: () => scoreboard(),
