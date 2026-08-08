@@ -65,6 +65,10 @@ const SPOT1D_FAST = parseInt(process.env.SPOT1D_FAST || '8');
 const SPOT1D_SLOW = parseInt(process.env.SPOT1D_SLOW || '24');
 // Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
 // Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
+// ── Funding accrual (Graduation gate G7): paper perp positions pay/receive REAL
+// Hyperliquid hourly funding, so paper P&L stops being fiction. FUNDING=OFF disables.
+const FUNDING = (process.env.FUNDING || 'ON').toUpperCase();
+const FUNDING_MS = parseInt(process.env.FUNDING_MS || '600000'); // check every 10 min
 const SUSPEND_THESIS_TAGS = (process.env.SUSPEND_THESIS_TAGS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 // ACTUARY edge vote: weight of the historical-expectancy conviction vote (0 disables),
 // and the minimum bucket sample size before the archive is allowed to speak.
@@ -125,7 +129,8 @@ function saveState() {
       positions: state.positions, trades: state.trades.slice(0, 300), decisions: state.decisions.slice(0, 200),
       posSeq: state.posSeq, decSeq: state.decSeq, vetoCounts: state.vetoCounts,
       trend4hLastActedT: state.trend4hLastActedT || null,
-      spot1dLastActedT: state.spot1dLastActedT || null };
+      spot1dLastActedT: state.spot1dLastActedT || null,
+      fundingNet: state.fundingNet || 0 };
     fs.writeFileSync(path.join(STATE_DIR, 'throne.json'), JSON.stringify(snap));
   } catch (e) {}
 }
@@ -223,9 +228,41 @@ function rNow(pos, px) {
 }
 function equityNow() {
   let u = 0;
-  state.positions.forEach(p => { const px = state.prices[p.asset]; if (px) u += unrealized(p, px); });
+  state.positions.forEach(p => { const px = state.prices[p.asset]; if (px) u += unrealized(p, px); u += (p.fundingUsd || 0); });
   return START_BUDGET + state.realized + u;
 }
+// ── Funding accrual: real HL hourly funding applied to open paper positions ──
+// LONG pays when rate > 0, SHORT receives (and vice versa): usd = -dir * notional * rate.
+// Positions opened before this patch are backfilled with fields at boot (accrual
+// starts from deploy time — history before the patch is not retro-charged).
+state.positions.forEach(p => { if (p.fundingUsd === undefined) { p.fundingUsd = 0; p.lastFundingT = Date.now(); } });
+state.fundingNet = state.fundingNet || 0;
+
+async function accrueFunding() {
+  if (FUNDING !== 'ON' || !state.positions.length) return;
+  for (const p of state.positions.slice()) {
+    try {
+      const res = await fetch(HL_API, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'fundingHistory', coin: p.asset, startTime: (p.lastFundingT || Date.now()) + 1 }), timeout: 12000 });
+      if (!res.ok) continue;
+      const points = await res.json();
+      if (!Array.isArray(points)) continue;
+      const dir = p.direction === 'LONG' ? 1 : -1;
+      for (const f of points) {
+        const rate = parseFloat(f.fundingRate);
+        const t = +f.time;
+        if (!Number.isFinite(rate) || !Number.isFinite(t) || t <= (p.lastFundingT || 0)) continue;
+        const usd = -dir * p.notional * rate;
+        p.fundingUsd = +((p.fundingUsd || 0) + usd).toFixed(6);
+        p.lastFundingT = t;
+        state.fundingNet = +((state.fundingNet || 0) + usd).toFixed(6);
+      }
+    } catch (e) { /* HL hiccup — accrue on the next tick, lastFundingT keeps us exact */ }
+  }
+}
+setInterval(() => accrueFunding().catch(() => {}), FUNDING_MS);
+setTimeout(() => accrueFunding().catch(() => {}), 20000);
+
 // THESIS TAG: identifies concurrent trades that share the SAME macro bet across DIFFERENT
 // assets (e.g. "extreme fear, buy the dip" expressed via BTC, UNI and AAVE at once) — a pattern
 // MATRIX's price-correlation clustering does not catch, since these assets needn't be correlated.
@@ -517,6 +554,7 @@ async function decisionCycle() {
         stopPx: +(fillPx * (1 - dir * riskDistPct)).toPrecision(6),
         targetPx: +(fillPx * (1 + dir * riskDistPct * TARGET_R)).toPrecision(6),
         trailArmed: false, openedAt: nowIso(), conviction, votes, vizier: { verdict: vizier.verdict, reason: (vizier.reason || '').slice(0, 160) },
+        fundingUsd: 0, lastFundingT: Date.now(),
       };
       state.realized -= entryFee; state.fees += entryFee;
       state.positions.push(pos);
@@ -568,11 +606,12 @@ function closePosition(pos, px, reason) {
   const fillPx = px * (1 + slip);
   const pnl = d * (fillPx - pos.entryPx) / pos.entryPx * pos.notional;
   const exitFee = pos.notional * FEE_BPS / 10000;
-  const netPnl = pnl - exitFee;
+  const funding = +(pos.fundingUsd || 0);
+  const netPnl = pnl - exitFee + funding;
   const rMult = +(d * (fillPx - pos.entryPx) / pos.riskDist).toFixed(2);
   state.realized += netPnl; state.fees += exitFee;
   state.positions = state.positions.filter(p => p.id !== pos.id);
-  const trade = { ...pos, exitPx: +fillPx.toPrecision(6), closedAt: nowIso(), reason, pnl: +netPnl.toFixed(2), r: rMult };
+  const trade = { ...pos, exitPx: +fillPx.toPrecision(6), closedAt: nowIso(), reason, pnl: +netPnl.toFixed(2), r: rMult, funding: +funding.toFixed(4) };
   state.trades.unshift(trade);
   state.trades = state.trades.slice(0, 500);
   record({ asset: pos.asset, direction: pos.direction, source: pos.source, action: 'CLOSED', rationale: `${reason} · ${rMult}R · ${fmt$(netPnl)}` });
@@ -697,6 +736,7 @@ wss.on('connection',ws=>{
   }catch(e){}});});
 
 app.get('/health',(_,res)=>res.json({agent:'SUPREME-LEADER',status:'LIVE',mode:state.mode,paused:state.paused,
+  funding:FUNDING,fundingNet:+(state.fundingNet||0).toFixed(4),
   geckoConnected:state.geckoConnected,uptime:Date.now()-state.startTime,cycles:state.cycleCount,
   equity:state.equity,positions:state.positions.length,trades:state.trades.length,
   herald:!!(EMAIL_TO&&GMAIL_APP_PASSWORD),siblings:state.siblingStatus,errors:state.errors.slice(-3)}));
