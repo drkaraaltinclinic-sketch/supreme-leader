@@ -63,6 +63,15 @@ const TREND4H_SLOW = parseInt(process.env.TREND4H_SLOW || '24');
 const SPOT_SLEEVE = (process.env.SPOT_SLEEVE || 'ON').toUpperCase();  // ON | OFF
 const SPOT1D_FAST = parseInt(process.env.SPOT1D_FAST || '8');
 const SPOT1D_SLOW = parseInt(process.env.SPOT1D_SLOW || '24');
+// ── JESSE sleeve (sovereign adoption by Dr K 2026-08-10; CODEX cards #30 BBSqueezeTrend
+// + #26 ETHSTPullback30m — the two clean-risk Jesse cards). SHADOW-first probation:
+// signals logged + a shadow book managed with each card's OWN exit rules; no real
+// entries until promoted. Promote: JESSE_MODE=LIVE (no deploy). Kill: JESSE_SLEEVE=OFF.
+const JESSE_SLEEVE = (process.env.JESSE_SLEEVE || 'ON').toUpperCase(); // ON | OFF
+const JESSE_MODE = (process.env.JESSE_MODE || 'SHADOW').toUpperCase(); // SHADOW | LIVE
+const JESSE_BB_COIN = process.env.JESSE_BB_COIN || 'ETH';
+const JESSE_STP_COIN = process.env.JESSE_STP_COIN || 'ETH';
+const jesseSleeve = require('./jesse-sleeve');
 // Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
 // Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
 // ── Funding accrual (Graduation gate G7): paper perp positions pay/receive REAL
@@ -130,6 +139,9 @@ function saveState() {
       posSeq: state.posSeq, decSeq: state.decSeq, vetoCounts: state.vetoCounts,
       trend4hLastActedT: state.trend4hLastActedT || null,
       spot1dLastActedT: state.spot1dLastActedT || null,
+      jesseBBLastActedT: state.jesseBBLastActedT || null,
+      jesseSTPLastActedT: state.jesseSTPLastActedT || null,
+      jesseShadow: state.jesseShadow || { positions: [], trades: [] },
       fundingNet: state.fundingNet || 0 };
     fs.writeFileSync(path.join(STATE_DIR, 'throne.json'), JSON.stringify(snap));
   } catch (e) {}
@@ -158,6 +170,9 @@ loadState();
   });
   if (n) console.log(`[BOOT] Backfilled thesisTag on ${n} pre-existing position(s)`);
 })();
+state.jesseShadow = state.jesseShadow || { positions: [], trades: [] };
+state.jesseShadow.positions = state.jesseShadow.positions || [];
+state.jesseShadow.trades = state.jesseShadow.trades || [];
 setInterval(saveState, 60000);
 
 // ─── HERALD: raw Gmail SMTP (no dependencies) ─────────────────────────────────
@@ -418,6 +433,49 @@ async function decisionCycle() {
       } catch (e) { reportError(`spot1d: ${e.message}`); }
     }
 
+    // ── JESSE sleeve: CODEX #30 + #26, shadow-first probation ──
+    if (JESSE_SLEEVE === 'ON') {
+      const regimeByStrategy = {};
+      for (const [getter, coin, actedKey] of [
+        [jesseSleeve.getBBSignal, JESSE_BB_COIN, 'jesseBBLastActedT'],
+        [jesseSleeve.getSTPSignal, JESSE_STP_COIN, 'jesseSTPLastActedT'],
+      ]) {
+        try {
+          const sig = await getter(fetch, HL_API, coin);
+          if (!sig.ready) continue;
+          if (sig.strategy === 'JESSE_STP') regimeByStrategy.JESSE_STP = sig.regime === 0 ? null : sig.regime;
+          const px = state.prices[coin];
+          if (!sig.direction || !px) continue;
+          if (sig.lastBarT === state[actedKey]) continue; // one action per closed bar / squeeze fire
+          const inShadow = state.jesseShadow.positions.find(p => p.strategy === sig.strategy);
+          const inBook = state.positions.find(p => p.source === sig.strategy);
+          if (JESSE_MODE === 'LIVE') {
+            if (!inBook) candidates.push({ asset: coin, direction: sig.direction, source: sig.strategy,
+              engineScore: 0, atrPct: sig.atrPct, jesseBarT: sig.lastBarT, jesseActedKey: actedKey,
+              jesse: { atrAbs: sig.atrAbs, stopMult: sig.stopMult, trailMult: sig.trailMult, minOffsetAtr: sig.minOffsetAtr },
+              rationale: `${sig.strategy} ${sig.direction} (ADX ${sig.adx}) — CODEX ${sig.strategy === 'JESSE_BB' ? '#30' : '#26'}` });
+          } else if (!inShadow) {
+            state[actedKey] = sig.lastBarT;
+            jesseSleeve.shadowOpen(state.jesseShadow, sig, coin, px);
+            record({ asset: coin, direction: sig.direction, source: sig.strategy, action: 'SHADOW_OPEN',
+              rationale: `${sig.strategy} shadow entry @ ${px} · stop ${sig.stopMult}xATR · ADX ${sig.adx}` });
+          }
+        } catch (e) { reportError(`jesse: ${e.message}`); }
+      }
+      // shadow book runs the cards' own exits (chandelier/monotonic trail, regime flip)
+      jesseSleeve.shadowManage(state.jesseShadow, state.prices, regimeByStrategy)
+        .forEach(t => record({ asset: t.asset, direction: t.direction, source: t.strategy,
+          action: 'SHADOW_CLOSE', rationale: `${t.reason} · ${t.pnlPct}%` }));
+      // LIVE: #26's hard regime-flip liquidation for an open JESSE_STP paper position
+      if (regimeByStrategy.JESSE_STP !== undefined) {
+        const p = state.positions.find(x => x.source === 'JESSE_STP');
+        if (p && state.prices[p.asset]) {
+          const d = p.direction === 'LONG' ? 1 : -1;
+          if (regimeByStrategy.JESSE_STP !== d) closePosition(p, state.prices[p.asset], 'REGIME_FLIP');
+        }
+      }
+    }
+
     let executed = 0;
     for (const cand of candidates.slice(0, 12)) {
       if (state.positions.length >= MAX_POSITIONS) break;
@@ -444,7 +502,7 @@ async function decisionCycle() {
       // Thesis cluster: with only MAX_POSITIONS(4) slots, 2-3 concurrent contrarian-fear (or
       // contrarian-greed) longs/shorts across unrelated tickers can fill most of the book on one bet.
       // Mechanical sleeves (TREND4H, SPOT1D) are not contrarian theses — exempt from thesis tagging.
-      const mech = cand.source === 'TREND4H' || cand.source === 'SPOT1D';
+      const mech = cand.source === 'TREND4H' || cand.source === 'SPOT1D' || !!cand.jesse;
       const thesisTag = mech ? null : thesisTagFor(cand.direction, fng);
       const sameThesisOpen = thesisTag ? state.positions.filter(p => p.thesisTag === thesisTag).length : 0;
       if (thesisTag && sameThesisOpen >= 2) vetoes.push('THESIS_CLUSTER_CAP');
@@ -532,7 +590,9 @@ async function decisionCycle() {
 
       // ── SIZE & EXECUTE (paper) ──
       const atrPct = cand.atrPct || 3;
-      const riskDistPct = (ATR_STOP_MULT * atrPct) / 100;
+      // JESSE positions use the card's own stop distance (stopMult × its own ATR);
+      // everything else keeps the standard ATR_STOP_MULT stop. Risk-$ math is identical.
+      const riskDistPct = cand.jesse ? (cand.jesse.stopMult * cand.jesse.atrAbs) / px : (ATR_STOP_MULT * atrPct) / 100;
       const convMult = mech ? 1 : Math.max(0.5, Math.min(1.5, conviction / CONVICTION_MIN));
       const riskUsd = eq * (RISK_PCT / 100) * convMult * (vizier.sizeMultiplier || 1);
       let notional = riskUsd / riskDistPct;
@@ -552,7 +612,9 @@ async function decisionCycle() {
         entryPx: +fillPx.toPrecision(6), notional: +notional.toFixed(2),
         riskUsd: +riskUsd.toFixed(2), riskDist: fillPx * riskDistPct,
         stopPx: +(fillPx * (1 - dir * riskDistPct)).toPrecision(6),
-        targetPx: +(fillPx * (1 + dir * riskDistPct * TARGET_R)).toPrecision(6),
+        // JESSE cards have NO profit target — the right tail is the edge (#26 doctrine)
+        targetPx: cand.jesse ? null : +(fillPx * (1 + dir * riskDistPct * TARGET_R)).toPrecision(6),
+        jesse: cand.jesse || null, peakPx: cand.jesse ? +fillPx.toPrecision(6) : undefined,
         trailArmed: false, openedAt: nowIso(), conviction, votes, vizier: { verdict: vizier.verdict, reason: (vizier.reason || '').slice(0, 160) },
         fundingUsd: 0, lastFundingT: Date.now(),
       };
@@ -560,6 +622,7 @@ async function decisionCycle() {
       state.positions.push(pos);
       if (cand.trend4hBarT) state.trend4hLastActedT = cand.trend4hBarT;
       if (cand.spot1dBarT) state.spot1dLastActedT = cand.spot1dBarT;
+      if (cand.jesseBarT) state[cand.jesseActedKey] = cand.jesseBarT;
       state.todayOpens++; executed++;
       record({ asset: pos.asset, direction: pos.direction, source: pos.source, action: 'EXECUTED', conviction, votes,
         vizier: pos.vizier, sizing: { notional: pos.notional, riskUsd: pos.riskUsd, entry: pos.entryPx, stop: pos.stopPx, target: pos.targetPx } });
@@ -581,20 +644,32 @@ async function manage() {
     if (!px) continue;
     const d = pos.direction === 'LONG' ? 1 : -1;
     const r = rNow(pos, px);
-    // Breakeven + trail once +1R
-    if (!pos.trailArmed && r >= 1) { pos.trailArmed = true; pos.stopPx = pos.entryPx; emit('SYS', 'supreme.trail', { id: pos.id, asset: pos.asset, note: 'stop → breakeven at +1R' }); }
-    if (pos.trailArmed) {
-      const trail = px * (1 - d * (pos.riskDist / pos.entryPx));
+    if (pos.jesse) {
+      // JESSE card management: the card's own trail (chandelier for #26, monotonic
+      // for #30) ratcheting from the best price since entry. No target, no time stop.
+      pos.peakPx = d === 1 ? Math.max(pos.peakPx || pos.entryPx, px) : Math.min(pos.peakPx || pos.entryPx, px);
+      const off = (pos.jesse.minOffsetAtr || 0) * pos.jesse.atrAbs;
+      const trail = d === 1
+        ? Math.min(pos.peakPx - pos.jesse.trailMult * pos.jesse.atrAbs, px - off)
+        : Math.max(pos.peakPx + pos.jesse.trailMult * pos.jesse.atrAbs, px + off);
       if (d === 1 && trail > pos.stopPx) pos.stopPx = +trail.toPrecision(6);
       if (d === -1 && trail < pos.stopPx) pos.stopPx = +trail.toPrecision(6);
+    } else {
+      // Breakeven + trail once +1R
+      if (!pos.trailArmed && r >= 1) { pos.trailArmed = true; pos.stopPx = pos.entryPx; emit('SYS', 'supreme.trail', { id: pos.id, asset: pos.asset, note: 'stop → breakeven at +1R' }); }
+      if (pos.trailArmed) {
+        const trail = px * (1 - d * (pos.riskDist / pos.entryPx));
+        if (d === 1 && trail > pos.stopPx) pos.stopPx = +trail.toPrecision(6);
+        if (d === -1 && trail < pos.stopPx) pos.stopPx = +trail.toPrecision(6);
+      }
     }
     const hitStop = d === 1 ? px <= pos.stopPx : px >= pos.stopPx;
-    const hitTarget = d === 1 ? px >= pos.targetPx : px <= pos.targetPx;
+    const hitTarget = pos.targetPx != null && (d === 1 ? px >= pos.targetPx : px <= pos.targetPx);
     const ageH = (Date.now() - new Date(pos.openedAt).getTime()) / 3600000;
     const venue = (state.snapshot['SENTINEL-01']?.stats?.venue || '').toUpperCase();
-    if (hitStop) toClose.push({ pos, px: pos.stopPx, reason: pos.trailArmed ? 'TRAIL_STOP' : 'STOP' });
+    if (hitStop) toClose.push({ pos, px: pos.stopPx, reason: pos.trailArmed || pos.jesse ? 'TRAIL_STOP' : 'STOP' });
     else if (hitTarget) toClose.push({ pos, px: pos.targetPx, reason: 'TARGET' });
-    else if (ageH >= MAX_HOLD_H) toClose.push({ pos, px, reason: 'TIME_STOP' });
+    else if (ageH >= MAX_HOLD_H && !pos.jesse) toClose.push({ pos, px, reason: 'TIME_STOP' });
     else if (venue === 'DEGRADED') toClose.push({ pos, px, reason: 'VENUE_DEGRADED(Tier-1 fact change)' });
   }
   toClose.forEach(({ pos, px, reason }) => closePosition(pos, px, reason));
@@ -743,6 +818,17 @@ app.get('/health',(_,res)=>res.json({agent:'SUPREME-LEADER',status:'LIVE',mode:s
 app.get('/treasury',(_,res)=>res.json({equity:state.equity,startBudget:START_BUDGET,realized:state.realized,fees:state.fees,
   positions:state.positions,scoreboard:scoreboard()}));
 app.get('/decisions',(_,res)=>res.json({decisions:state.decisions}));
+app.get('/jesse',(_,res)=>{
+  const tr=state.jesseShadow.trades;
+  const wins=tr.filter(t=>t.pnlPct>0);
+  res.json({sleeve:JESSE_SLEEVE,mode:JESSE_MODE,coins:{JESSE_BB:JESSE_BB_COIN,JESSE_STP:JESSE_STP_COIN},
+    cards:{JESSE_BB:'CODEX #30 BBSqueezeTrend',JESSE_STP:'CODEX #26 ETHSTPullback30m'},
+    lastActed:{JESSE_BB:state.jesseBBLastActedT||null,JESSE_STP:state.jesseSTPLastActedT||null},
+    shadow:{open:state.jesseShadow.positions,trades:tr.slice(0,50),
+      stats:{n:tr.length,winRate:tr.length?+((wins.length/tr.length)*100).toFixed(1):null,
+        sumPnlPct:+tr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}},
+    livePositions:state.positions.filter(p=>p.jesse)});
+});
 app.get('/trades',(_,res)=>res.json({trades:state.trades}));
 app.post('/cycle',(_,res)=>{decisionCycle();res.json({ok:true});});
 app.post('/pause',(_,res)=>{state.paused=true;res.json({paused:true});});
@@ -751,7 +837,7 @@ app.post('/digest',(_,res)=>{sendEmail(`👑 Daily Digest — Equity ${fmt$(equi
 const { mountWeeklyReport } = require('./weekly-report');
 mountWeeklyReport(app, {
   getState: () => state,
-  getConfig: () => ({ ENTRY_MODE, TREND4H_FAST, TREND4H_SLOW, SPOT_SLEEVE, SPOT1D_FAST, SPOT1D_SLOW, START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
+  getConfig: () => ({ ENTRY_MODE, TREND4H_FAST, TREND4H_SLOW, SPOT_SLEEVE, SPOT1D_FAST, SPOT1D_SLOW, JESSE_SLEEVE, JESSE_MODE, START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
     MAX_NEW_PER_DAY, MAX_LEV, NET_DELTA_CAP, ATR_STOP_MULT, TARGET_R, MAX_HOLD_H,
     FEE_BPS, SLIP_BPS, MIN_VOL_USD, MIN_OI_USD, ENTRY_SCORE, DECISION_MS, STRATEGY_MODE }),
   getScoreboard: () => scoreboard(),
