@@ -41,6 +41,7 @@ const NET_DELTA_CAP = parseFloat(process.env.NET_DELTA_CAP || '1.5'); // × equi
 const ATR_STOP_MULT = parseFloat(process.env.ATR_STOP_MULT || '1.5');
 const TARGET_R = parseFloat(process.env.TARGET_R || '2');
 const MAX_HOLD_H = parseFloat(process.env.MAX_HOLD_H || '72');
+const SPOT1D_MAX_HOLD_H = parseFloat(process.env.SPOT1D_MAX_HOLD_H || '0'); // 0 = inherit MAX_HOLD_H (sovereign: Dr K may set e.g. 720 to unchain the 1d spot sleeve)
 const FEE_BPS = parseFloat(process.env.FEE_BPS || '3.5');             // per side
 const SLIP_BPS = parseFloat(process.env.SLIP_BPS || '5');             // adverse per side
 const MIN_VOL_USD = parseFloat(process.env.MIN_VOL_USD || '10000000');
@@ -669,7 +670,7 @@ async function manage() {
     const venue = (state.snapshot['SENTINEL-01']?.stats?.venue || '').toUpperCase();
     if (hitStop) toClose.push({ pos, px: pos.stopPx, reason: pos.trailArmed || pos.jesse ? 'TRAIL_STOP' : 'STOP' });
     else if (hitTarget) toClose.push({ pos, px: pos.targetPx, reason: 'TARGET' });
-    else if (ageH >= MAX_HOLD_H && !pos.jesse) toClose.push({ pos, px, reason: 'TIME_STOP' });
+    else if (ageH >= ((pos.source === 'SPOT1D' && SPOT1D_MAX_HOLD_H > 0) ? SPOT1D_MAX_HOLD_H : MAX_HOLD_H) && !pos.jesse) toClose.push({ pos, px, reason: 'TIME_STOP' });
     else if (venue === 'DEGRADED') toClose.push({ pos, px, reason: 'VENUE_DEGRADED(Tier-1 fact change)' });
   }
   toClose.forEach(({ pos, px, reason }) => closePosition(pos, px, reason));
@@ -838,7 +839,7 @@ const { mountWeeklyReport } = require('./weekly-report');
 mountWeeklyReport(app, {
   getState: () => state,
   getConfig: () => ({ ENTRY_MODE, TREND4H_FAST, TREND4H_SLOW, SPOT_SLEEVE, SPOT1D_FAST, SPOT1D_SLOW, JESSE_SLEEVE, JESSE_MODE, START_BUDGET, RISK_PCT, CONVICTION_MIN, MAX_POSITIONS,
-    MAX_NEW_PER_DAY, MAX_LEV, NET_DELTA_CAP, ATR_STOP_MULT, TARGET_R, MAX_HOLD_H,
+    MAX_NEW_PER_DAY, MAX_LEV, NET_DELTA_CAP, ATR_STOP_MULT, TARGET_R, MAX_HOLD_H, SPOT1D_MAX_HOLD_H,
     FEE_BPS, SLIP_BPS, MIN_VOL_USD, MIN_OI_USD, ENTRY_SCORE, DECISION_MS, STRATEGY_MODE }),
   getScoreboard: () => scoreboard(),
   getEquityNow:  () => equityNow(),
