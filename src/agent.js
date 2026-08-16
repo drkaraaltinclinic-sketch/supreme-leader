@@ -80,6 +80,7 @@ const jesseSleeve = require('./jesse-sleeve');
 const FUNDING = (process.env.FUNDING || 'ON').toUpperCase();
 const FUNDING_MS = parseInt(process.env.FUNDING_MS || '600000'); // check every 10 min
 const SUSPEND_THESIS_TAGS = (process.env.SUSPEND_THESIS_TAGS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const CONTROL_TOKEN = process.env.CONTROL_TOKEN || ''; // '' = control auth OFF (default-inert); set by Dr K's hand to lock /cycle /pause /resume /digest + WS control
 // ACTUARY edge vote: weight of the historical-expectancy conviction vote (0 disables),
 // and the minimum bucket sample size before the archive is allowed to speak.
 const EDGE_WEIGHT = parseFloat(process.env.EDGE_WEIGHT || '1');
@@ -804,12 +805,31 @@ wss.on('connection',ws=>{
       stats:{uptime:Date.now()-state.startTime,cycles:state.cycleCount,lastCycle:state.lastCycleAt}}}));
   ws.on('message',raw=>{try{const m=JSON.parse(raw.toString());
     if(m.type==='PING')ws.send(JSON.stringify({type:'PONG',agentId:'SUPREME-LEADER'}));
+    const CONTROL_TYPES=['CYCLE','PAUSE','RESUME','TEST_EMAIL','CLOSE_POSITION'];
+    if(CONTROL_TYPES.includes(m.type)&&!ctlOk(m.token)){
+      state.controlDenied=(state.controlDenied||0)+1;
+      ws.send(JSON.stringify({type:'SYS',topic:'supreme.control.denied',agentId:'SUPREME-LEADER',timestamp:nowIso(),data:{type:m.type}}));
+      return;
+    }
     if(m.type==='CYCLE')decisionCycle();
     if(m.type==='PAUSE'){state.paused=true;emit('SYS','supreme.paused',{});}
     if(m.type==='RESUME'){state.paused=false;emit('SYS','supreme.resumed',{});}
     if(m.type==='TEST_EMAIL')sendEmail('👑 HERALD test — the throne can reach you',digestHtml()).then(ok=>emit('SYS','supreme.email.test',{ok}));
     if(m.type==='CLOSE_POSITION'&&m.id){const p=state.positions.find(x=>x.id===m.id);if(p&&state.prices[p.asset])closePosition(p,state.prices[p.asset],'MANUAL');}
   }catch(e){}});});
+
+// ── CONTROL AUTH (Sultan's Review 2026-08-16) ─────────────────────────────
+// CONTROL_TOKEN env unset (default) → auth OFF, behavior identical to before.
+// When Dr K sets CONTROL_TOKEN (sovereign hand, like SPOT1D_MAX_HOLD_H):
+//   HTTP control routes require header x-control-token: <token> (or ?token=),
+//   WS control messages (CYCLE/PAUSE/RESUME/TEST_EMAIL/CLOSE_POSITION) require m.token.
+// Read-only endpoints (/health, /trades, /jesse, reports, WS handshake) stay open.
+function ctlOk(supplied){return !CONTROL_TOKEN||supplied===CONTROL_TOKEN;}
+function ctlGuard(req,res,next){
+  if(ctlOk(req.headers['x-control-token']||req.query.token))return next();
+  state.controlDenied=(state.controlDenied||0)+1;
+  res.status(401).json({error:'CONTROL_TOKEN required'});
+}
 
 app.get('/health',(_,res)=>res.json({agent:'SUPREME-LEADER',status:'LIVE',mode:state.mode,paused:state.paused,
   funding:FUNDING,fundingNet:+(state.fundingNet||0).toFixed(4),
@@ -831,10 +851,10 @@ app.get('/jesse',(_,res)=>{
     livePositions:state.positions.filter(p=>p.jesse)});
 });
 app.get('/trades',(_,res)=>res.json({trades:state.trades}));
-app.post('/cycle',(_,res)=>{decisionCycle();res.json({ok:true});});
-app.post('/pause',(_,res)=>{state.paused=true;res.json({paused:true});});
-app.post('/resume',(_,res)=>{state.paused=false;res.json({paused:false});});
-app.post('/digest',(_,res)=>{sendEmail(`👑 Daily Digest — Equity ${fmt$(equityNow())}`,digestHtml()).then(ok=>res.json({sent:ok}));});
+app.post('/cycle',ctlGuard,(_,res)=>{decisionCycle();res.json({ok:true});});
+app.post('/pause',ctlGuard,(_,res)=>{state.paused=true;res.json({paused:true});});
+app.post('/resume',ctlGuard,(_,res)=>{state.paused=false;res.json({paused:false});});
+app.post('/digest',ctlGuard,(_,res)=>{sendEmail(`👑 Daily Digest — Equity ${fmt$(equityNow())}`,digestHtml()).then(ok=>res.json({sent:ok}));});
 const { mountWeeklyReport } = require('./weekly-report');
 mountWeeklyReport(app, {
   getState: () => state,
