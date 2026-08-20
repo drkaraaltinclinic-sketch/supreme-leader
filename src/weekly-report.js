@@ -2,6 +2,10 @@
 
 /**
  * weekly-report.js — SUPREME-LEADER weekly report generator
+ * v1.3 · v1.2 + per-sleeve stats (sleeves section): closed count, W/L, PF, net P&L
+ *        grouped by trade source (TREND4H / SPOT1D / ENGINE / JESSE_*), plus a
+ *        mechanical-sleeve rollup — sleeve PF is the redesign-probation metric and
+ *        was previously not observable from the report (Sultan's Review 2026-08-19)
  * v1.2 · v1.1 schema + actuaryEdge vote visibility in the decision record and
  *        per-trade openedAt (Sultan's Review observability items)
  *
@@ -81,6 +85,55 @@ function aggregateByExitReason(trades) {
   return [...m.values()]
     .map((r) => ({ ...r, avgR: r.rN ? r.rSum / r.rN : NaN, avgHold: r.holdN ? r.holdSum / r.holdN : NaN }))
     .sort((a, b) => b.count - a.count);
+}
+
+/**
+ * Per-sleeve stats — the redesign-probation view.
+ *
+ * Every trade carries `source` (TREND4H, SPOT1D, ENGINE, JESSE_*, BLUEPRINT#n, …).
+ * Mechanical sleeves (SLEEVE_SOURCES) are the post-redesign book; their PF is the
+ * metric probation is judged on, so it must be reproducible from the report rather
+ * than recomputed by hand from trade rows each review. Purely informational —
+ * graduation gates still come from scoreboard() and are not touched here.
+ */
+const SLEEVE_SOURCES = ['TREND4H', 'SPOT1D'];
+
+function sumPnl(trades) {
+  return trades.reduce((s, t) => {
+    const p = num(t.pnl, NaN);
+    return Number.isFinite(p) ? s + p : s;
+  }, 0);
+}
+
+function computeSleeveStats(trades) {
+  const groups = new Map();
+  for (const t of trades) {
+    const src = t.source || 'ENGINE';
+    if (!groups.has(src)) groups.set(src, []);
+    groups.get(src).push(t);
+  }
+  const bySource = [...groups.entries()]
+    .map(([source, ts]) => ({
+      source,
+      isSleeve: SLEEVE_SOURCES.includes(source),
+      trades: ts.length,
+      pnl: sumPnl(ts),
+      lastCloseAt: ts.map((t) => t.closedAt).filter(Boolean).sort().pop() || null,
+      ...computeProfitFactor(ts),
+      ...computeWinRate(ts),
+    }))
+    .sort((a, b) => b.trades - a.trades);
+  const sleeveTrades = trades.filter((t) => SLEEVE_SOURCES.includes(t.source));
+  return {
+    sleeveSources: SLEEVE_SOURCES,
+    bySource,
+    sleeveRollup: {
+      trades: sleeveTrades.length,
+      pnl: sumPnl(sleeveTrades),
+      ...computeProfitFactor(sleeveTrades),
+      ...computeWinRate(sleeveTrades),
+    },
+  };
 }
 
 /**
@@ -207,7 +260,7 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
 
   return {
     generatedAt: new Date().toISOString(),
-    version: '1.2',
+    version: '1.3',
     windowDays: WINDOW_DAYS,
 
     performance: {
@@ -222,6 +275,7 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
     allTime: { ...computeProfitFactor(trades), ...computeWinRate(trades), trades: trades.length },
     thisWeek: { ...computeProfitFactor(windowTrades), ...computeWinRate(windowTrades), trades: windowTrades.length },
     scoreboard: sb,
+    sleeves: computeSleeveStats(trades),
 
     // Is the book full? If positions >= MAX_POSITIONS the decision loop breaks on the
     // FIRST candidate — zero executions is then correct behaviour, not a gate failure.
@@ -308,6 +362,21 @@ function renderMarkdown(rep) {
   L.push(`| Drawdown | ${sb.maxDrawdownPct ?? '—'}% | < 15% | ${yn(cr.dd15)} |`);
   L.push(`| Days | ${sb.days ?? '—'} | ≥ 21 | ${yn(cr.days21)} |`);
   L.push(`| Vetoes proven | ${sb.vetoesFired ?? '—'} | ≥ 5 | ${yn(cr.vetoesProven)} |`);
+  L.push('');
+
+  L.push(`## 3b. Sleeve scoreboard (redesign probation — informational)`);
+  L.push('');
+  const sl = obj(rep.sleeves), roll = obj(sl.sleeveRollup);
+  L.push(`Mechanical sleeves (${arr(sl.sleeveSources).join(' + ') || '—'}): **${roll.trades ?? 0} closed** · ` +
+    `PF ${pf(roll.profitFactor)} · win rate ${pct(roll.winRate, 1)} · net ${money(roll.pnl)}`);
+  L.push('');
+  if (arr(sl.bySource).length) {
+    L.push(`| Source | Closed | W/L/S | Win rate | PF | Net P&L | Last close |`, `|---|---|---|---|---|---|---|`);
+    for (const r of arr(sl.bySource)) {
+      L.push(`| ${r.source}${r.isSleeve ? ' *' : ''} | ${r.trades} | ${r.wins}/${r.losses}/${r.scratches} | ${pct(r.winRate, 1)} | ${pf(r.profitFactor)} | ${money(r.pnl)} | ${r.lastCloseAt || '—'} |`);
+    }
+    L.push('', `_* mechanical sleeve — counts toward the sleeve rollup above._`);
+  }
   L.push('');
 
   L.push(`## 4. Exit-reason breakdown`);
@@ -446,5 +515,5 @@ function mountWeeklyReport(app, opts = {}) {
 module.exports = {
   mountWeeklyReport, buildReport, renderMarkdown,
   aggregateByExitReason, analyseDecisions, liquidityGate,
-  computeProfitFactor, computeWinRate,
+  computeProfitFactor, computeWinRate, computeSleeveStats,
 };
