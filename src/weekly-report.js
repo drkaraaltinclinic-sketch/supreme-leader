@@ -2,6 +2,11 @@
 
 /**
  * weekly-report.js — SUPREME-LEADER weekly report generator
+ * v1.4 · v1.3 + review-window section: /api/report/weekly.json?since=<ISO> adds a
+ *        `sinceWindow` block — aggregates (PF, win rate, exit reasons, sleeves) over
+ *        trades closed AFTER the given timestamp, computed by the same code as the
+ *        cumulative numbers. The Sultan's Review 3-day window is then read, not
+ *        re-derived by hand from trade rows each run (Sultan's Review 2026-08-22)
  * v1.3 · v1.2 + per-sleeve stats (sleeves section): closed count, W/L, PF, net P&L
  *        grouped by trade source (TREND4H / SPOT1D / ENGINE / JESSE_*), plus a
  *        mechanical-sleeve rollup — sleeve PF is the redesign-probation metric and
@@ -233,8 +238,20 @@ function liquidityGate(meta, cfg) {
   };
 }
 
+/** Single mapping for an emitted trade row — used by the all-time table and the
+ *  since-window rows so the two can never drift apart. */
+function mapTradeRow(t) {
+  return {
+    asset: t.asset, direction: t.direction, entryPx: t.entryPx, exitPx: t.exitPx,
+    r: num(t.r, NaN), pnl: num(t.pnl, NaN), reason: t.reason,
+    heldHours: heldHours(t), vizier: obj(t.vizier).verdict || '',
+    thesisTag: t.thesisTag || '', conviction: t.conviction, source: t.source,
+    openedAt: t.openedAt || null, closedAt: t.closedAt,
+  };
+}
+
 // ── assembly ─────────────────────────────────────────────────────────────────
-function buildReport({ state, config, scoreboard, equityNow } = {}) {
+function buildReport({ state, config, scoreboard, equityNow, sinceTs } = {}) {
   const s = obj(state);
   const cfg = obj(config);
   const sb = obj(scoreboard);
@@ -254,14 +271,35 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
     return !isNaN(d) && Date.now() - d.getTime() <= WINDOW_DAYS * 86400000;
   });
 
+  // v1.4 — caller-defined review window. Only trades closed strictly AFTER sinceTs.
+  // Invalid/absent `since` → null section; purely informational, touches nothing else.
+  let sinceWindow = null;
+  if (Number.isFinite(sinceTs)) {
+    const rows = trades.filter((t) => {
+      const d = new Date(t.closedAt);
+      return !isNaN(d) && d.getTime() > sinceTs;
+    });
+    sinceWindow = {
+      since: new Date(sinceTs).toISOString(),
+      trades: rows.length,
+      pnl: sumPnl(rows),
+      ...computeProfitFactor(rows),
+      ...computeWinRate(rows),
+      exitReasons: aggregateByExitReason(rows),
+      sleeves: computeSleeveStats(rows),
+      rows: rows.map(mapTradeRow),
+    };
+  }
+
   const maxPos = num(cfg.MAX_POSITIONS, 4);
   const totalRisk = positions.reduce((a, p) => a + num(p.riskUsd, 0), 0);
   const netDelta = positions.reduce((a, p) => a + (p.direction === 'LONG' ? 1 : -1) * num(p.notional, 0), 0);
 
   return {
     generatedAt: new Date().toISOString(),
-    version: '1.3',
+    version: '1.4',
     windowDays: WINDOW_DAYS,
+    sinceWindow,
 
     performance: {
       equity: eqNow, startBudget, realized, unrealized,
@@ -302,13 +340,7 @@ function buildReport({ state, config, scoreboard, equityNow } = {}) {
       vizier: obj(p.vizier).verdict || null, source: p.source, openedAt: p.openedAt,
     })),
 
-    trades: trades.slice(0, MAX_TRADE_ROWS).map((t) => ({
-      asset: t.asset, direction: t.direction, entryPx: t.entryPx, exitPx: t.exitPx,
-      r: num(t.r, NaN), pnl: num(t.pnl, NaN), reason: t.reason,
-      heldHours: heldHours(t), vizier: obj(t.vizier).verdict || '',
-      thesisTag: t.thesisTag || '', conviction: t.conviction, source: t.source,
-      openedAt: t.openedAt || null, closedAt: t.closedAt,
-    })),
+    trades: trades.slice(0, MAX_TRADE_ROWS).map(mapTradeRow),
     tradesTruncated: Math.max(0, trades.length - MAX_TRADE_ROWS),
   };
 }
@@ -493,11 +525,12 @@ function mountWeeklyReport(app, opts = {}) {
   if (!app || typeof app.get !== 'function') throw new Error('mountWeeklyReport: express app required');
   if (typeof getState !== 'function') throw new Error('mountWeeklyReport: getState required');
 
-  const make = () => buildReport({
+  const make = (sinceTs) => buildReport({
     state: getState(),
     config: safe(() => (typeof getConfig === 'function' ? getConfig() : {}), {}),
     scoreboard: safe(() => (typeof getScoreboard === 'function' ? getScoreboard() : {}), {}),
     equityNow: safe(() => (typeof getEquityNow === 'function' ? getEquityNow() : undefined), undefined),
+    sinceTs,
   });
 
   app.get('/api/report/weekly', (_req, res) => {
@@ -505,8 +538,12 @@ function mountWeeklyReport(app, opts = {}) {
     catch (e) { res.status(500).type('text/plain').send(`report error: ${e.message}\n\n${e.stack}`); }
   });
 
-  app.get('/api/report/weekly.json', (_req, res) => {
-    try { res.json(make()); } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+  app.get('/api/report/weekly.json', (req, res) => {
+    try {
+      const q = req.query ? req.query.since : undefined;
+      const ts = q ? Date.parse(String(q)) : NaN;   // bad input → NaN → sinceWindow: null
+      res.json(make(ts));
+    } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
   });
 
   console.log('[weekly-report] mounted at /api/report/weekly');
