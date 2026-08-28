@@ -73,6 +73,12 @@ const JESSE_MODE = (process.env.JESSE_MODE || 'SHADOW').toUpperCase(); // SHADOW
 const JESSE_BB_COIN = process.env.JESSE_BB_COIN || 'ETH';
 const JESSE_STP_COIN = process.env.JESSE_STP_COIN || 'ETH';
 const jesseSleeve = require('./jesse-sleeve');
+// ── ETH-REVERSION sleeve (sovereign adoption by Dr K 2026-08-28; SHADOW-only probation
+// of the crucible_reversion architecture — assays #49 90d 1.247, #50 180d 1.189,
+// #54 max-window 1.11). No live entry path exists; promotion is a future sovereign patch.
+const REVERSION_SLEEVE = (process.env.REVERSION_SLEEVE || 'ON').toUpperCase(); // ON | OFF
+const REVERSION_COIN = process.env.REVERSION_COIN || 'ETH';
+const reversionSleeve = require('./reversion-sleeve');
 // Comma-separated thesis tags to suspend (e.g. SUSPEND_THESIS_TAGS=CONTRARIAN_FEAR_LONG).
 // Entries whose thesis tag is listed here are vetoed at Tier 1 as THESIS_SUSPENDED.
 // ── Funding accrual (Graduation gate G7): paper perp positions pay/receive REAL
@@ -145,6 +151,9 @@ function saveState() {
       jesseSTPLastActedT: state.jesseSTPLastActedT || null,
       jesseShadow: state.jesseShadow || { positions: [], trades: [] },
       jesseDiag: state.jesseDiag || {},
+      reversionShadow: state.reversionShadow || { positions: [], trades: [] },
+      reversionLastActedT: state.reversionLastActedT || null,
+      reversionDiag: state.reversionDiag || null,
       fundingNet: state.fundingNet || 0 };
     fs.writeFileSync(path.join(STATE_DIR, 'throne.json'), JSON.stringify(snap));
   } catch (e) {}
@@ -176,6 +185,9 @@ loadState();
 state.jesseShadow = state.jesseShadow || { positions: [], trades: [] };
 state.jesseShadow.positions = state.jesseShadow.positions || [];
 state.jesseShadow.trades = state.jesseShadow.trades || [];
+state.reversionShadow = state.reversionShadow || { positions: [], trades: [] };
+state.reversionShadow.positions = state.reversionShadow.positions || [];
+state.reversionShadow.trades = state.reversionShadow.trades || [];
 setInterval(saveState, 60000);
 
 // ─── HERALD: raw Gmail SMTP (no dependencies) ─────────────────────────────────
@@ -485,6 +497,33 @@ async function decisionCycle() {
           if (regimeByStrategy.JESSE_STP !== d) closePosition(p, state.prices[p.asset], 'REGIME_FLIP');
         }
       }
+    }
+
+    // ── ETH-REVERSION sleeve (sovereign adoption by Dr K 2026-08-28): SHADOW ONLY ──
+    // Live mirror of crucible_reversion (assays #49/#50/#54). There is deliberately
+    // NO live entry path here — promotion to the paper book is a separate sovereign
+    // patch, not an env flip. Kill: REVERSION_SLEEVE=OFF.
+    if (REVERSION_SLEEVE === 'ON') {
+      try {
+        const rvBars = await reversionSleeve.fetchClosedBars(fetch, HL_API, REVERSION_COIN, 80);
+        const rv = reversionSleeve.evaluate(rvBars);
+        if (rv.ready) {
+          state.reversionDiag = { at: new Date().toISOString(), lastBarT: rv.lastBarT,
+            gateOpen: rv.gateOpen, band: rv.band, rsi: rv.rsi,
+            direction: rv.direction, lastClose: rv.lastClose };
+          reversionSleeve.shadowManage(state.reversionShadow, rvBars)
+            .forEach(t => record({ asset: t.asset, direction: t.direction, source: 'REVERSION1H',
+              action: 'SHADOW_CLOSE', rationale: `${t.reason} · ${t.pnlPct}% · ${t.r}R` }));
+          const rvOpen = state.reversionShadow.positions.find(p => p.strategy === 'REVERSION1H');
+          if (rv.direction && rv.lastBarT !== state.reversionLastActedT && !rvOpen) {
+            state.reversionLastActedT = rv.lastBarT;
+            reversionSleeve.shadowOpen(state.reversionShadow, rv, REVERSION_COIN);
+            record({ asset: REVERSION_COIN, direction: rv.direction, source: 'REVERSION1H',
+              action: 'SHADOW_OPEN',
+              rationale: `regime band ${rv.band} < ${reversionSleeve.CFG.bandPct} · RSI ${rv.rsi} · shadow entry @ ${rv.lastClose}` });
+          }
+        }
+      } catch (e) { reportError(`reversion: ${e.message}`); }
     }
 
     let executed = 0;
@@ -859,6 +898,17 @@ app.get('/jesse',(_,res)=>{
       stats:{n:tr.length,winRate:tr.length?+((wins.length/tr.length)*100).toFixed(1):null,
         sumPnlPct:+tr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}},
     livePositions:state.positions.filter(p=>p.jesse)});
+});
+app.get('/reversion',(_,res)=>{
+  const tr=state.reversionShadow.trades;
+  const wins=tr.filter(t=>t.pnlPct>0);
+  res.json({sleeve:REVERSION_SLEEVE,mode:'SHADOW',coin:REVERSION_COIN,
+    adopted:'2026-08-28 sovereign (Dr K) — live mirror of crucible_reversion (assays #49/#50/#54); promotion = future sovereign patch',
+    cfg:reversionSleeve.CFG,diag:state.reversionDiag||null,
+    lastActed:state.reversionLastActedT||null,
+    shadow:{open:state.reversionShadow.positions,trades:tr.slice(0,50),
+      stats:{n:tr.length,winRate:tr.length?+((wins.length/tr.length)*100).toFixed(1):null,
+        sumPnlPct:+tr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}}});
 });
 app.get('/trades',(_,res)=>res.json({trades:state.trades}));
 app.post('/cycle',ctlGuard,(_,res)=>{decisionCycle();res.json({ok:true});});
