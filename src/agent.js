@@ -144,6 +144,7 @@ function saveState() {
       jesseBBLastActedT: state.jesseBBLastActedT || null,
       jesseSTPLastActedT: state.jesseSTPLastActedT || null,
       jesseShadow: state.jesseShadow || { positions: [], trades: [] },
+      jesseDiag: state.jesseDiag || {},
       fundingNet: state.fundingNet || 0 };
     fs.writeFileSync(path.join(STATE_DIR, 'throne.json'), JSON.stringify(snap));
   } catch (e) {}
@@ -446,6 +447,14 @@ async function decisionCycle() {
           const sig = await getter(fetch, HL_API, coin);
           if (!sig.ready) continue;
           if (sig.strategy === 'JESSE_STP') regimeByStrategy.JESSE_STP = sig.regime === 0 ? null : sig.regime;
+          // Observability (Sultan's Review 2026-08-28): record every evaluation, not only
+          // actions — distinguishes "no qualifying setups" from dead plumbing when the
+          // shadow book sits inert (10 days and counting as of this patch).
+          state.jesseDiag = state.jesseDiag || {};
+          state.jesseDiag[sig.strategy] = { at: new Date().toISOString(), lastBarT: sig.lastBarT,
+            direction: sig.direction || null, adx: sig.adx != null ? sig.adx : null,
+            regime: sig.regime != null ? sig.regime : null, since: sig.since != null ? sig.since : null,
+            fired: sig.fired != null ? sig.fired : null, lastClose: sig.lastClose != null ? sig.lastClose : null };
           const px = state.prices[coin];
           if (!sig.direction || !px) continue;
           if (sig.lastBarT === state[actedKey]) continue; // one action per closed bar / squeeze fire
@@ -845,6 +854,7 @@ app.get('/jesse',(_,res)=>{
   res.json({sleeve:JESSE_SLEEVE,mode:JESSE_MODE,coins:{JESSE_BB:JESSE_BB_COIN,JESSE_STP:JESSE_STP_COIN},
     cards:{JESSE_BB:'CODEX #30 BBSqueezeTrend',JESSE_STP:'CODEX #26 ETHSTPullback30m'},
     lastActed:{JESSE_BB:state.jesseBBLastActedT||null,JESSE_STP:state.jesseSTPLastActedT||null},
+    diag:state.jesseDiag||{},
     shadow:{open:state.jesseShadow.positions,trades:tr.slice(0,50),
       stats:{n:tr.length,winRate:tr.length?+((wins.length/tr.length)*100).toFixed(1):null,
         sumPnlPct:+tr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}},
