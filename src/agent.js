@@ -120,6 +120,16 @@ const state = {
   startTime: Date.now(), bornAt: Date.now(), geckoConnected: false, paused: false,
   mode: 'PAPER',
   equity: START_BUDGET, realized: 0, fees: 0, peakEquity: START_BUDGET, maxDrawdownPct: 0,
+  // G3 RULING (delegated by Dr K, enacted 2026-08-31): the dd15 graduation gate is
+  // measured on SLEEVE-ERA drawdown, anchored at the 2026-08-06 redesign adoption.
+  // Single-use re-anchor — future redesigns do NOT re-anchor without a new ruling.
+  // All-time maxDrawdownPct (17.28 frozen) is retained above, keeps reporting in
+  // every weekly/scoreboard forever, and remains WARDEN's HARD_DD basis.
+  // Seeds: eraPeakEquity = highest review-verified equity since the anchor
+  // (97.18, 2026-08-28 review); eraMaxDrawdownPct = 1.75, the worst realized
+  // peak-to-trough recomputed from the closed-trade sequence Aug 6→31
+  // (intraday marks pre-deploy are unrecoverable; live tracking takes over now).
+  eraAnchor: '2026-08-06T00:00:00Z', eraPeakEquity: 97.18, eraMaxDrawdownPct: 1.75,
   positions: [],       // open
   trades: [],          // closed (newest first)
   decisions: [],       // court record (newest first, 200)
@@ -143,6 +153,7 @@ function saveState() {
     if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
     const snap = { bornAt: state.bornAt, equity: state.equity, realized: state.realized, fees: state.fees,
       peakEquity: state.peakEquity, maxDrawdownPct: state.maxDrawdownPct,
+      eraAnchor: state.eraAnchor, eraPeakEquity: state.eraPeakEquity, eraMaxDrawdownPct: state.eraMaxDrawdownPct,
       positions: state.positions, trades: state.trades.slice(0, 300), decisions: state.decisions.slice(0, 200),
       posSeq: state.posSeq, decSeq: state.decSeq, vetoCounts: state.vetoCounts,
       trend4hLastActedT: state.trend4hLastActedT || null,
@@ -188,6 +199,10 @@ state.jesseShadow.trades = state.jesseShadow.trades || [];
 state.reversionShadow = state.reversionShadow || { positions: [], trades: [] };
 state.reversionShadow.positions = state.reversionShadow.positions || [];
 state.reversionShadow.trades = state.reversionShadow.trades || [];
+// G3 ruling fields: a throne.json written before 2026-08-31 has no era keys — seed them.
+state.eraAnchor = state.eraAnchor || '2026-08-06T00:00:00Z';
+state.eraPeakEquity = (typeof state.eraPeakEquity === 'number') ? state.eraPeakEquity : 97.18;
+state.eraMaxDrawdownPct = (typeof state.eraMaxDrawdownPct === 'number') ? state.eraMaxDrawdownPct : 1.75;
 setInterval(saveState, 60000);
 
 // ─── HERALD: raw Gmail SMTP (no dependencies) ─────────────────────────────────
@@ -750,6 +765,10 @@ function updateEquityStats() {
   if (eq > state.peakEquity) state.peakEquity = eq;
   const dd = state.peakEquity > 0 ? ((state.peakEquity - eq) / state.peakEquity) * 100 : 0;
   if (dd > state.maxDrawdownPct) state.maxDrawdownPct = +dd.toFixed(2);
+  // Sleeve-era track (G3 ruling 2026-08-31) — all-time track above is untouched.
+  if (eq > state.eraPeakEquity) state.eraPeakEquity = eq;
+  const edd = state.eraPeakEquity > 0 ? ((state.eraPeakEquity - eq) / state.eraPeakEquity) * 100 : 0;
+  if (edd > state.eraMaxDrawdownPct) state.eraMaxDrawdownPct = +edd.toFixed(2);
 }
 
 // ─── Graduation scoreboard ────────────────────────────────────────────────────
@@ -765,7 +784,9 @@ function scoreboard() {
     trades: closed.length, winRate: closed.length ? +((wins.length / closed.length) * 100).toFixed(1) : 0,
     profitFactor: pf, avgR: closed.length ? +(closed.reduce((s, t) => s + t.r, 0) / closed.length).toFixed(2) : 0,
     maxDrawdownPct: state.maxDrawdownPct, days, vetoesFired,
-    criteria: { trades30: closed.length >= 30, pf12: pf > 1.2, dd15: state.maxDrawdownPct < 15, days21: days >= 21, vetoesProven: vetoesFired >= 5 },
+    eraMaxDrawdownPct: state.eraMaxDrawdownPct, eraAnchor: state.eraAnchor,
+    dd15Basis: 'SLEEVE_ERA (ruling 2026-08-31: anchored at 2026-08-06 redesign adoption, single-use; all-time retained and remains WARDEN basis)',
+    criteria: { trades30: closed.length >= 30, pf12: pf > 1.2, dd15: state.eraMaxDrawdownPct < 15, days21: days >= 21, vetoesProven: vetoesFired >= 5 },
   };
 }
 
@@ -804,7 +825,7 @@ function digestHtml() {
   <h3 style="color:#d4a017">Recent Trades</h3><table>${tRows}</table>
   <h3 style="color:#d4a017">🎓 Graduation Scoreboard</h3>
   <table>${row('Trades', `${sb.trades}/30 ${check(crit.trades30)}`)}${row('Profit factor', `${sb.profitFactor} (>1.2) ${check(crit.pf12)}`)}${
-    row('Win rate / Avg R', `${sb.winRate}% / ${sb.avgR}R`)}${row('Drawdown', `${sb.maxDrawdownPct}% (<15%) ${check(crit.dd15)}`)}${
+    row('Win rate / Avg R', `${sb.winRate}% / ${sb.avgR}R`)}${row('Drawdown', `era ${sb.eraMaxDrawdownPct}% (<15%) ${check(crit.dd15)} · all-time ${sb.maxDrawdownPct}%`)}${
     row('Days', `${sb.days}/21 ${check(crit.days21)}`)}${row('Vetoes proven', `${sb.vetoesFired} fired ${check(crit.vetoesProven)}`)}</table>
   <p style="color:#9a8a60;font-size:11px">Real money flows only when every box is checked. — SUPREME LEADER</p>`);
 }
