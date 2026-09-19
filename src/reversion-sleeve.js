@@ -15,10 +15,11 @@
  *                at 1h bar close — identical to the assayed mechanics, so the
  *                shadow ledger is directly comparable to the assay evidence.
  *
- * SHADOW ONLY: signals open paper-shadow positions — the real (paper) book is
- * never touched, and no live entry path exists in this module or its wiring.
- * Promotion to the live paper book is a separate SOVEREIGN patch (Dr K's hand),
- * never an env flip. Kill switch: REVERSION_SLEEVE=OFF.
+ * PROMOTED (sovereign, Dr K, 2026-09-19): after shadow probation (Aug 28 → Sep 2026)
+ * the sleeve's signals route into the live paper book via agent.js's standard
+ * Tier-1 veto + sizing path. This module stays pure signal + shadow bookkeeping;
+ * the frozen probation ledger remains served under /reversion.
+ * Kill switch: REVERSION_SLEEVE=OFF.
  */
 
 const H1_MS = 3600_000;

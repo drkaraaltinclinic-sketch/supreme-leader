@@ -101,7 +101,7 @@ function aggregateByExitReason(trades) {
  * than recomputed by hand from trade rows each review. Purely informational —
  * graduation gates still come from scoreboard() and are not touched here.
  */
-const SLEEVE_SOURCES = ['TREND4H', 'SPOT1D'];
+const SLEEVE_SOURCES = ['TREND4H', 'SPOT1D', 'REVERSION1H'];
 
 function sumPnl(trades) {
   return trades.reduce((s, t) => {

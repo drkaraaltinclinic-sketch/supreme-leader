@@ -514,10 +514,11 @@ async function decisionCycle() {
       }
     }
 
-    // ── ETH-REVERSION sleeve (sovereign adoption by Dr K 2026-08-28): SHADOW ONLY ──
-    // Live mirror of crucible_reversion (assays #49/#50/#54). There is deliberately
-    // NO live entry path here — promotion to the paper book is a separate sovereign
-    // patch, not an env flip. Kill: REVERSION_SLEEVE=OFF.
+    // ── ETH-REVERSION sleeve (sovereign adoption by Dr K 2026-08-28; PROMOTED to the
+    // live paper book by sovereign decision, Dr K, 2026-09-19) ──
+    // Live mirror of crucible_reversion (assays #49/#50/#54), proven in shadow
+    // probation (Aug 28 → Sep 2026). Entries now route through the standard Tier-1
+    // veto + sizing path like the other mechanical sleeves. Kill: REVERSION_SLEEVE=OFF.
     if (REVERSION_SLEEVE === 'ON') {
       try {
         const rvBars = await reversionSleeve.fetchClosedBars(fetch, HL_API, REVERSION_COIN, 80);
@@ -529,13 +530,16 @@ async function decisionCycle() {
           reversionSleeve.shadowManage(state.reversionShadow, rvBars)
             .forEach(t => record({ asset: t.asset, direction: t.direction, source: 'REVERSION1H',
               action: 'SHADOW_CLOSE', rationale: `${t.reason} · ${t.pnlPct}% · ${t.r}R` }));
-          const rvOpen = state.reversionShadow.positions.find(p => p.strategy === 'REVERSION1H');
-          if (rv.direction && rv.lastBarT !== state.reversionLastActedT && !rvOpen) {
-            state.reversionLastActedT = rv.lastBarT;
-            reversionSleeve.shadowOpen(state.reversionShadow, rv, REVERSION_COIN);
-            record({ asset: REVERSION_COIN, direction: rv.direction, source: 'REVERSION1H',
-              action: 'SHADOW_OPEN',
-              rationale: `regime band ${rv.band} < ${reversionSleeve.CFG.bandPct} · RSI ${rv.rsi} · shadow entry @ ${rv.lastClose}` });
+          // The probation shadow ledger keeps closing whatever shadow position remains
+          // (shadowManage above), then freezes as the permanent probation record —
+          // no new shadow opens after promotion.
+          const rvInBook = state.positions.find(p => p.source === 'REVERSION1H');
+          if (rv.direction && rv.lastBarT !== state.reversionLastActedT && !rvInBook) {
+            candidates.push({ asset: REVERSION_COIN, direction: rv.direction, source: 'REVERSION1H',
+              engineScore: 0, atrPct: +(rv.atrAbs / rv.lastClose * 100).toFixed(3),
+              reversionBarT: rv.lastBarT,
+              reversion: { atrAbs: rv.atrAbs, stopMult: reversionSleeve.CFG.stopMult },
+              rationale: `REVERSION1H ${rv.direction} — band ${rv.band} < ${reversionSleeve.CFG.bandPct} · RSI ${rv.rsi} (assays #49/#50/#54 · promoted after shadow probation)` });
           }
         }
       } catch (e) { reportError(`reversion: ${e.message}`); }
@@ -567,7 +571,7 @@ async function decisionCycle() {
       // Thesis cluster: with only MAX_POSITIONS(4) slots, 2-3 concurrent contrarian-fear (or
       // contrarian-greed) longs/shorts across unrelated tickers can fill most of the book on one bet.
       // Mechanical sleeves (TREND4H, SPOT1D) are not contrarian theses — exempt from thesis tagging.
-      const mech = cand.source === 'TREND4H' || cand.source === 'SPOT1D' || !!cand.jesse;
+      const mech = cand.source === 'TREND4H' || cand.source === 'SPOT1D' || cand.source === 'REVERSION1H' || !!cand.jesse;
       const thesisTag = mech ? null : thesisTagFor(cand.direction, fng);
       const sameThesisOpen = thesisTag ? state.positions.filter(p => p.thesisTag === thesisTag).length : 0;
       if (thesisTag && sameThesisOpen >= 2) vetoes.push('THESIS_CLUSTER_CAP');
@@ -657,7 +661,9 @@ async function decisionCycle() {
       const atrPct = cand.atrPct || 3;
       // JESSE positions use the card's own stop distance (stopMult × its own ATR);
       // everything else keeps the standard ATR_STOP_MULT stop. Risk-$ math is identical.
-      const riskDistPct = cand.jesse ? (cand.jesse.stopMult * cand.jesse.atrAbs) / px : (ATR_STOP_MULT * atrPct) / 100;
+      const riskDistPct = cand.jesse ? (cand.jesse.stopMult * cand.jesse.atrAbs) / px
+        : cand.reversion ? (cand.reversion.stopMult * cand.reversion.atrAbs) / px
+        : (ATR_STOP_MULT * atrPct) / 100;
       const convMult = mech ? 1 : Math.max(0.5, Math.min(1.5, conviction / CONVICTION_MIN));
       const riskUsd = eq * (RISK_PCT / 100) * convMult * (vizier.sizeMultiplier || 1);
       let notional = riskUsd / riskDistPct;
@@ -688,6 +694,7 @@ async function decisionCycle() {
       if (cand.trend4hBarT) state.trend4hLastActedT = cand.trend4hBarT;
       if (cand.spot1dBarT) state.spot1dLastActedT = cand.spot1dBarT;
       if (cand.jesseBarT) state[cand.jesseActedKey] = cand.jesseBarT;
+      if (cand.reversionBarT) state.reversionLastActedT = cand.reversionBarT;
       state.todayOpens++; executed++;
       record({ asset: pos.asset, direction: pos.direction, source: pos.source, action: 'EXECUTED', conviction, votes,
         vizier: pos.vizier, sizing: { notional: pos.notional, riskUsd: pos.riskUsd, entry: pos.entryPx, stop: pos.stopPx, target: pos.targetPx } });
@@ -719,8 +726,11 @@ async function manage() {
         : Math.max(pos.peakPx + pos.jesse.trailMult * pos.jesse.atrAbs, px + off);
       if (d === 1 && trail > pos.stopPx) pos.stopPx = +trail.toPrecision(6);
       if (d === -1 && trail < pos.stopPx) pos.stopPx = +trail.toPrecision(6);
-    } else {
-      // Breakeven + trail once +1R
+    } else if (pos.source !== 'REVERSION1H') {
+      // Breakeven + trail once +1R. REVERSION1H is exempt: the assayed mechanics
+      // (#49/#50/#54 and the shadow probation record) are a FIXED 1.5×ATR stop,
+      // 2R target, 72h time stop — no breakeven, no trail. Fidelity to the
+      // evidence beats book uniformity here.
       if (!pos.trailArmed && r >= 1) { pos.trailArmed = true; pos.stopPx = pos.entryPx; emit('SYS', 'supreme.trail', { id: pos.id, asset: pos.asset, note: 'stop → breakeven at +1R' }); }
       if (pos.trailArmed) {
         const trail = px * (1 - d * (pos.riskDist / pos.entryPx));
@@ -923,8 +933,10 @@ app.get('/jesse',(_,res)=>{
 app.get('/reversion',(_,res)=>{
   const tr=state.reversionShadow.trades;
   const wins=tr.filter(t=>t.pnlPct>0);
-  res.json({sleeve:REVERSION_SLEEVE,mode:'SHADOW',coin:REVERSION_COIN,
-    adopted:'2026-08-28 sovereign (Dr K) — live mirror of crucible_reversion (assays #49/#50/#54); promotion = future sovereign patch',
+  res.json({sleeve:REVERSION_SLEEVE,mode:'LIVE',coin:REVERSION_COIN,
+    adopted:'2026-08-28 sovereign (Dr K) — live mirror of crucible_reversion (assays #49/#50/#54)',
+    promoted:'2026-09-19 sovereign (Dr K) — live paper-book entries via the standard veto/sizing path; probation shadow ledger frozen below',
+    book:state.positions.filter(p=>p.source==='REVERSION1H'),
     cfg:reversionSleeve.CFG,diag:state.reversionDiag||null,
     lastActed:state.reversionLastActedT||null,
     shadow:{open:state.reversionShadow.positions,trades:tr.slice(0,50),
