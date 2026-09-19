@@ -790,13 +790,28 @@ function scoreboard() {
   const pf = grossLoss > 0 ? +(grossWin / grossLoss).toFixed(2) : (grossWin > 0 ? 99 : 0);
   const days = +((Date.now() - state.bornAt) / 86400000).toFixed(1);
   const vetoesFired = Object.values(state.vetoCounts).reduce((a, b) => a + b, 0);
+  // G5 RULING (sovereign, Dr K, 2026-09-19 — pre-committed, single-use): the PF
+  // gate re-bases AUTOMATICALLY to the sleeve-era rollup (TREND4H/SPOT1D/
+  // REVERSION1H, era anchor 2026-08-06) the moment the rollup reaches 30 closed
+  // trades — the same evidence set the trades gate graduates on. Until then the
+  // gate stays on cumulative PF. Cumulative PF is reported forever either way.
+  const G5_SLEEVES = ['TREND4H', 'SPOT1D', 'REVERSION1H'];
+  const sleeveClosed = closed.filter(t => G5_SLEEVES.includes(t.source));
+  const sGrossWin = sleeveClosed.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
+  const sGrossLoss = Math.abs(sleeveClosed.filter(t => t.pnl <= 0).reduce((s, t) => s + t.pnl, 0));
+  const rollupPf = sGrossLoss > 0 ? +(sGrossWin / sGrossLoss).toFixed(2) : (sGrossWin > 0 ? 99 : 0);
+  const pfGateRebased = sleeveClosed.length >= 30;
   return {
     trades: closed.length, winRate: closed.length ? +((wins.length / closed.length) * 100).toFixed(1) : 0,
     profitFactor: pf, avgR: closed.length ? +(closed.reduce((s, t) => s + t.r, 0) / closed.length).toFixed(2) : 0,
     maxDrawdownPct: state.maxDrawdownPct, days, vetoesFired,
     eraMaxDrawdownPct: state.eraMaxDrawdownPct, eraAnchor: state.eraAnchor,
     dd15Basis: 'SLEEVE_ERA (ruling 2026-08-31: anchored at 2026-08-06 redesign adoption, single-use; all-time retained and remains WARDEN basis)',
-    criteria: { trades30: closed.length >= 30, pf12: pf > 1.2, dd15: state.eraMaxDrawdownPct < 15, days21: days >= 21, vetoesProven: vetoesFired >= 5 },
+    rollupTrades: sleeveClosed.length, rollupProfitFactor: rollupPf,
+    pf12Basis: pfGateRebased
+      ? 'SLEEVE_ERA_ROLLUP (ruling 2026-09-19: auto-rebased at rollup n≥30, single-use, anchor 2026-08-06; cumulative PF reported forever)'
+      : `CUMULATIVE — auto-rebases to sleeve-era rollup at n≥30 (ruling 2026-09-19, pre-committed; rollup now ${sleeveClosed.length}/30)`,
+    criteria: { trades30: closed.length >= 30, pf12: (pfGateRebased ? rollupPf : pf) > 1.2, dd15: state.eraMaxDrawdownPct < 15, days21: days >= 21, vetoesProven: vetoesFired >= 5 },
   };
 }
 

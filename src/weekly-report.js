@@ -390,7 +390,8 @@ function renderMarkdown(rep) {
   const yn = (b) => (b ? 'PASS' : 'no');
   L.push(`| Gate | Value | Required | |`, `|---|---|---|---|`);
   L.push(`| Trades | ${sb.trades ?? '—'} | ≥ 30 | ${yn(cr.trades30)} |`);
-  L.push(`| Profit factor | ${sb.profitFactor ?? '—'} | > 1.2 | ${yn(cr.pf12)} |`);
+  L.push(`| Profit factor | ${sb.profitFactor ?? '—'} (rollup ${sb.rollupProfitFactor ?? '—'}, n=${sb.rollupTrades ?? 0}) | > 1.2 | ${yn(cr.pf12)} |`);
+  L.push(`| ↳ G5 basis | ${sb.pf12Basis ?? 'CUMULATIVE'} |  |  |`);
   L.push(`| Drawdown (sleeve-era, anchor 2026-08-06 — ruling 2026-08-31) | ${sb.eraMaxDrawdownPct ?? '—'}% | < 15% | ${yn(cr.dd15)} |`);
   L.push(`| Drawdown (all-time — retained forever, WARDEN basis) | ${sb.maxDrawdownPct ?? '—'}% | reported, not gated | — |`);
   L.push(`| Days | ${sb.days ?? '—'} | ≥ 21 | ${yn(cr.days21)} |`);
