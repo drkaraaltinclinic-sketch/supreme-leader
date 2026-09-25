@@ -163,6 +163,7 @@ function saveState() {
       jesseShadow: state.jesseShadow || { positions: [], trades: [] },
       jesseDiag: state.jesseDiag || {},
       reversionShadow: state.reversionShadow || { positions: [], trades: [] },
+      reversionFidelity: state.reversionFidelity || { positions: [], trades: [] },
       reversionLastActedT: state.reversionLastActedT || null,
       reversionDiag: state.reversionDiag || null,
       fundingNet: state.fundingNet || 0 };
@@ -199,6 +200,9 @@ state.jesseShadow.trades = state.jesseShadow.trades || [];
 state.reversionShadow = state.reversionShadow || { positions: [], trades: [] };
 state.reversionShadow.positions = state.reversionShadow.positions || [];
 state.reversionShadow.trades = state.reversionShadow.trades || [];
+state.reversionFidelity = state.reversionFidelity || { positions: [], trades: [] };
+state.reversionFidelity.positions = state.reversionFidelity.positions || [];
+state.reversionFidelity.trades = state.reversionFidelity.trades || [];
 // G3 ruling fields: a throne.json written before 2026-08-31 has no era keys — seed them.
 state.eraAnchor = state.eraAnchor || '2026-08-06T00:00:00Z';
 state.eraPeakEquity = (typeof state.eraPeakEquity === 'number') ? state.eraPeakEquity : 97.18;
@@ -530,6 +534,12 @@ async function decisionCycle() {
           reversionSleeve.shadowManage(state.reversionShadow, rvBars)
             .forEach(t => record({ asset: t.asset, direction: t.direction, source: 'REVERSION1H',
               action: 'SHADOW_CLOSE', rationale: `${t.reason} · ${t.pnlPct}% · ${t.r}R` }));
+          // FIDELITY TWIN (Sultan's Review 2026-09-25): each LIVE entry opens a bar-close
+          // managed twin (see execute loop); managing it here measures live tick-managed
+          // exits against the assayed bar-close mechanics. Bookkeeping only — no trading effect.
+          reversionSleeve.shadowManage(state.reversionFidelity, rvBars)
+            .forEach(t => record({ asset: t.asset, direction: t.direction, source: 'REVERSION1H',
+              action: 'FIDELITY_CLOSE', rationale: `bar-close twin · ${t.reason} · ${t.pnlPct}% · ${t.r}R` }));
           // The probation shadow ledger keeps closing whatever shadow position remains
           // (shadowManage above), then freezes as the permanent probation record —
           // no new shadow opens after promotion.
@@ -539,6 +549,7 @@ async function decisionCycle() {
               engineScore: 0, atrPct: +(rv.atrAbs / rv.lastClose * 100).toFixed(3),
               reversionBarT: rv.lastBarT,
               reversion: { atrAbs: rv.atrAbs, stopMult: reversionSleeve.CFG.stopMult },
+              reversionSig: { direction: rv.direction, atrAbs: rv.atrAbs, lastClose: rv.lastClose, lastBarT: rv.lastBarT },
               rationale: `REVERSION1H ${rv.direction} — band ${rv.band} < ${reversionSleeve.CFG.bandPct} · RSI ${rv.rsi} (assays #49/#50/#54 · promoted after shadow probation)` });
           }
         }
@@ -694,7 +705,11 @@ async function decisionCycle() {
       if (cand.trend4hBarT) state.trend4hLastActedT = cand.trend4hBarT;
       if (cand.spot1dBarT) state.spot1dLastActedT = cand.spot1dBarT;
       if (cand.jesseBarT) state[cand.jesseActedKey] = cand.jesseBarT;
-      if (cand.reversionBarT) state.reversionLastActedT = cand.reversionBarT;
+      if (cand.reversionBarT) {
+        state.reversionLastActedT = cand.reversionBarT;
+        // FIDELITY TWIN: mirror this live entry with the assayed bar-close mechanics
+        if (cand.reversionSig) reversionSleeve.shadowOpen(state.reversionFidelity, cand.reversionSig, REVERSION_COIN);
+      }
       state.todayOpens++; executed++;
       record({ asset: pos.asset, direction: pos.direction, source: pos.source, action: 'EXECUTED', conviction, votes,
         vizier: pos.vizier, sizing: { notional: pos.notional, riskUsd: pos.riskUsd, entry: pos.entryPx, stop: pos.stopPx, target: pos.targetPx } });
@@ -948,12 +963,17 @@ app.get('/jesse',(_,res)=>{
 app.get('/reversion',(_,res)=>{
   const tr=state.reversionShadow.trades;
   const wins=tr.filter(t=>t.pnlPct>0);
+  const ftr=state.reversionFidelity.trades;
   res.json({sleeve:REVERSION_SLEEVE,mode:'LIVE',coin:REVERSION_COIN,
     adopted:'2026-08-28 sovereign (Dr K) — live mirror of crucible_reversion (assays #49/#50/#54)',
     promoted:'2026-09-19 sovereign (Dr K) — live paper-book entries via the standard veto/sizing path; probation shadow ledger frozen below',
     book:state.positions.filter(p=>p.source==='REVERSION1H'),
     cfg:reversionSleeve.CFG,diag:state.reversionDiag||null,
     lastActed:state.reversionLastActedT||null,
+    fidelity:{note:'bar-close twin of each LIVE entry (Sultan\'s Review 2026-09-25) — live tick-managed vs assayed bar-close mechanics; instrumentation only',
+      open:state.reversionFidelity.positions,trades:ftr.slice(0,50),
+      stats:{n:ftr.length,winRate:ftr.length?+((ftr.filter(t=>t.pnlPct>0).length/ftr.length)*100).toFixed(1):null,
+        sumPnlPct:+ftr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}},
     shadow:{open:state.reversionShadow.positions,trades:tr.slice(0,50),
       stats:{n:tr.length,winRate:tr.length?+((wins.length/tr.length)*100).toFixed(1):null,
         sumPnlPct:+tr.reduce((s,t)=>s+t.pnlPct,0).toFixed(2)}}});
