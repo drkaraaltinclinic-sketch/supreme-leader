@@ -186,7 +186,7 @@ loadState();
 (function backfillThesisTags() {
   let n = 0;
   state.positions.forEach(p => {
-    if (p.source === 'TREND4H' || p.source === 'SPOT1D') return; // mechanical sleeves are never thesis-tagged
+    if (p.source === 'TREND4H' || p.source === 'SPOT1D' || p.source === 'REVERSION1H' || p.jesse) return; // mechanical sleeves are never thesis-tagged (mirror of the mech definition in the entry loop)
     if (p.thesisTag === undefined || p.thesisTag === null) {
       const tag = thesisTagFromVotes(p.direction, p.votes);
       if (tag) { p.thesisTag = tag; n++; }
